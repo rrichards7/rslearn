@@ -1,12 +1,11 @@
 """Tests for the rslearn.config.dataset module."""
 
-import warnings
 from datetime import timedelta
 
 import pytest
 from pydantic import ValidationError
 
-from rslearn.config.dataset import DType, LayerConfig, QueryConfig, TimeMode
+from rslearn.config.dataset import DType, LayerConfig
 from rslearn.data_sources.planetary_computer import Sentinel1, Sentinel2
 from rslearn.utils.raster_format import SingleImageRasterFormat
 from rslearn.utils.vector_format import TileVectorFormat
@@ -242,6 +241,8 @@ class TestBackwardsCompatibility:
         assert isinstance(ds, Sentinel1)
         assert ds.query is not None
         assert ds.query["sar:instrument_mode"] == {"eq": "IW"}
+        assert ds.cache_dir is not None
+        assert ds.cache_dir.path == "cache/planetary_computer"
 
     def test_raster_format_compat(self) -> None:
         """Check parsing for legacy raster format config format."""
@@ -262,28 +263,3 @@ class TestBackwardsCompatibility:
         raster_format = layer_config.band_sets[0].instantiate_raster_format()
         assert isinstance(raster_format, SingleImageRasterFormat)
         assert raster_format.format == "png"
-
-
-class TestQueryConfigTimeMode:
-    """Tests for the deprecated time_mode field in QueryConfig."""
-
-    def test_no_warning_when_time_mode_not_set(self) -> None:
-        """No warning should be emitted when time_mode is not in the config."""
-        with warnings.catch_warnings(record=True) as w:
-            warnings.simplefilter("always")
-            QueryConfig()
-            assert len(w) == 0
-
-    def test_warning_when_time_mode_set(self) -> None:
-        """A warning should be emitted when time_mode is set, and it should be excluded from dump."""
-        with warnings.catch_warnings(record=True) as w:
-            warnings.simplefilter("always")
-            query_config = QueryConfig(time_mode=TimeMode.WITHIN)
-            assert len(w) == 1
-            assert issubclass(w[0].category, FutureWarning)
-            assert "time_mode" in str(w[0].message)
-
-        # time_mode should be excluded from the dump
-        dumped = query_config.model_dump()
-        assert "space_mode" in dumped
-        assert "time_mode" not in dumped

@@ -4,6 +4,7 @@ import os
 import tempfile
 import zipfile
 from datetime import UTC, datetime, timedelta
+from typing import Any
 
 import requests
 import requests.auth
@@ -136,8 +137,9 @@ class CDL(DataSource):
 
         return groups
 
-    def deserialize_item(self, serialized_item: dict) -> Item:
+    def deserialize_item(self, serialized_item: Any) -> Item:
         """Deserializes an item from JSON-decoded data."""
+        assert isinstance(serialized_item, dict)
         return Item.deserialize(serialized_item)
 
     def ingest(
@@ -154,7 +156,7 @@ class CDL(DataSource):
             geometries: a list of geometries needed for each item
         """
         for item in items:
-            if tile_store.is_raster_ready(item, [self.band_name]):
+            if tile_store.is_raster_ready(item.name, [self.band_name]):
                 continue
 
             # Download the zip file.
@@ -189,8 +191,5 @@ class CDL(DataSource):
                 # Now we can ingest it.
                 logger.debug(f"Ingesting data for {item.name}")
                 tile_store.write_raster_file(
-                    item,
-                    [self.band_name],
-                    UPath(local_fname),
-                    time_range=item.geometry.time_range,
+                    item.name, [self.band_name], UPath(local_fname)
                 )

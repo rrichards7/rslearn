@@ -26,7 +26,6 @@ from rslearn.log_utils import get_logger
 from rslearn.tile_stores import TileStoreWithLayer
 from rslearn.utils.fsspec import join_upath, open_atomic
 from rslearn.utils.geometry import STGeometry, flatten_shape, split_at_antimeridian
-from rslearn.utils.raster_array import RasterArray
 from rslearn.utils.raster_format import get_raster_projection_and_bounds
 
 from .copernicus import get_harmonize_callback, get_sentinel2_tiles
@@ -766,22 +765,6 @@ class Sentinel2(DataSource):
             for item in self._read_bigquery(
                 time_range=geometry.time_range, wgs84_bbox=wgs84_bbox
             ):
-                # Get the item from XML to get its exact geometry (BigQuery only knows
-                # the bounding box of the item).
-                try:
-                    item = self.get_item_by_name(item.name)
-                except CorruptItemException as e:
-                    logger.warning("skipping corrupt item %s: %s", item.name, e.message)
-                    continue
-                except MissingXMLException:
-                    # Sometimes a scene that appears in the BigQuery index does not
-                    # actually have an XML file on GCS. Since we know this happens
-                    # occasionally, we ignore the error here.
-                    logger.warning(
-                        "skipping item %s that is missing XML file", item.name
-                    )
-                    continue
-
                 candidates[idx].append(item)
 
         return candidates
@@ -821,8 +804,9 @@ class Sentinel2(DataSource):
             groups.append(cur_groups)
         return groups
 
-    def deserialize_item(self, serialized_item: dict) -> Sentinel2Item:
+    def deserialize_item(self, serialized_item: Any) -> Sentinel2Item:
         """Deserializes an item from JSON-decoded data."""
+        assert isinstance(serialized_item, dict)
         return Sentinel2Item.deserialize(serialized_item)
 
     def retrieve_item(
@@ -855,7 +839,7 @@ class Sentinel2(DataSource):
         """
         for item in items:
             for suffix, band_names in self.needed_bands:
-                if tile_store.is_raster_ready(item, band_names):
+                if tile_store.is_raster_ready(item.name, band_names):
                     continue
 
                 with tempfile.TemporaryDirectory() as tmp_dir:
@@ -887,22 +871,12 @@ class Sentinel2(DataSource):
                             projection, bounds = get_raster_projection_and_bounds(src)
                         array = harmonize_callback(array)
                         tile_store.write_raster(
-                            item,
-                            band_names,
-                            projection,
-                            bounds,
-                            RasterArray(
-                                chw_array=array,
-                                time_range=item.geometry.time_range,
-                            ),
+                            item.name, band_names, projection, bounds, array
                         )
 
                     else:
                         tile_store.write_raster_file(
-                            item,
-                            band_names,
-                            UPath(fname),
-                            time_range=item.geometry.time_range,
+                            item.name, band_names, UPath(fname)
                         )
 
                 logger.debug(

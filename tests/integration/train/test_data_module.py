@@ -12,7 +12,6 @@ from rslearn.dataset import Dataset, Window
 from rslearn.train.data_module import RslearnDataModule
 from rslearn.train.dataset import DataInput, SplitConfig
 from rslearn.train.tasks.classification import ClassificationTask
-from rslearn.utils.raster_array import RasterArray
 from rslearn.utils.raster_format import GeotiffRasterFormat
 
 
@@ -34,8 +33,8 @@ class TestPredictLoader:
         classes=["negative", "positive"],
     )
     SPLIT_CONFIG = SplitConfig(
-        load_all_crops=True,
-        crop_size=2,
+        load_all_patches=True,
+        patch_size=2,
         skip_targets=True,
     )
 
@@ -63,7 +62,7 @@ class TestPredictLoader:
     def test_predict_dataloader_no_windows(self, empty_image_dataset: Dataset) -> None:
         """Verify that the dataloader works with no windows.
 
-        We use load_all_crops for prediction. Previously there were some bugs with
+        We use load_all_patches for prediction. Previously there were some bugs with
         this use case.
         """
         data_module = RslearnDataModule(
@@ -83,7 +82,7 @@ class TestPredictLoader:
         # Make the window 4x4 so there should be 4 patches.
         # We use batch size 2 so there should be 2 batches.
         window = Window(
-            storage=empty_image_dataset.storage,
+            path=Window.get_window_root(empty_image_dataset.path, "group", "window"),
             group="group",
             name="window",
             projection=WGS84_PROJECTION,
@@ -97,7 +96,7 @@ class TestPredictLoader:
             window.get_raster_dir(self.LAYER_NAME, self.BANDS),
             window.projection,
             window.bounds,
-            RasterArray(chw_array=image),
+            image,
         )
         window.mark_layer_completed(self.LAYER_NAME)
 
@@ -121,7 +120,7 @@ class TestPredictLoader:
         assert len(input_dicts2) == 2
         # All patches should be zero except the first one which should correspond to
         # the topleft of the image where we have set one pixel to 1.
-        assert input_dicts1[0]["image"].image.max() == 1
-        assert input_dicts1[1]["image"].image.max() == 0
-        assert input_dicts2[0]["image"].image.max() == 0
-        assert input_dicts2[1]["image"].image.max() == 0
+        assert input_dicts1[0]["image"].max() == 1
+        assert input_dicts1[1]["image"].max() == 0
+        assert input_dicts2[0]["image"].max() == 0
+        assert input_dicts2[1]["image"].max() == 0

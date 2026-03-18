@@ -7,7 +7,6 @@ import huggingface_hub.constants
 import torch
 
 from rslearn.models.terramind import Terramind, TerramindNormalize, TerramindSize
-from rslearn.train.model_context import ModelContext, RasterImage
 
 
 def test_terramind_without_resizing(tmp_path: pathlib.Path, monkeypatch: Any) -> None:
@@ -19,7 +18,7 @@ def test_terramind_without_resizing(tmp_path: pathlib.Path, monkeypatch: Any) ->
 
     inputs = [
         {
-            "RGB": RasterImage(torch.zeros((3, 1, 32, 32), dtype=torch.float32)),
+            "RGB": torch.zeros((3, 32, 32), dtype=torch.float32),
         }
     ]
 
@@ -28,12 +27,10 @@ def test_terramind_without_resizing(tmp_path: pathlib.Path, monkeypatch: Any) ->
     input_dict, _ = normalize.forward(inputs[0], {})
     normalized_inputs = [input_dict]
 
-    feature_list = terramind.forward(
-        ModelContext(inputs=normalized_inputs, metadatas=[])
-    )
+    feature_list = terramind.forward(normalized_inputs)
     # Should yield one feature map since there's only one output scale.
-    assert len(feature_list.feature_maps) == 1
-    features = feature_list.feature_maps[0]
+    assert len(feature_list) == 1
+    features = feature_list[0]
     # Features should be BxCxHxW
     assert features.shape[0] == 1
     assert features.shape[2] == 2
@@ -49,14 +46,14 @@ def test_terramind_with_resizing(tmp_path: pathlib.Path, monkeypatch: Any) -> No
 
     inputs = [
         {
-            "RGB": RasterImage(torch.zeros((3, 1, 32, 32), dtype=torch.float32)),
+            "RGB": torch.zeros((3, 32, 32), dtype=torch.float32),
         }
     ]
 
-    feature_list = terramind.forward(ModelContext(inputs=inputs, metadatas=[]))
+    feature_list = terramind.forward(inputs)
     # Should yield one feature map since there's only one output scale.
-    assert len(feature_list.feature_maps) == 1
-    features = feature_list.feature_maps[0]
+    assert len(feature_list) == 1
+    features = feature_list[0]
     # Features should be BxCxHxW
     assert features.shape[0] == 1
     assert features.shape[2] == 14

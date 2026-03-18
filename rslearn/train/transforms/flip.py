@@ -4,8 +4,6 @@ from typing import Any
 
 import torch
 
-from rslearn.train.model_context import RasterImage
-
 from .transform import Transform
 
 
@@ -18,7 +16,6 @@ class Flip(Transform):
         vertical: bool = True,
         image_selectors: list[str] = ["image"],
         box_selectors: list[str] = [],
-        skip_missing: bool = False,
     ):
         """Initialize a new Flip.
 
@@ -27,10 +24,8 @@ class Flip(Transform):
             vertical: whether to randomly flip vertically
             image_selectors: image items to transform.
             box_selectors: boxes items to transform.
-            skip_missing: if True, skip selectors that don't exist in the input/target
-                dicts. Useful when working with optional inputs.
         """
-        super().__init__(skip_missing=skip_missing)
+        super().__init__()
         self.horizontal = horizontal
         self.vertical = vertical
         self.image_selectors = image_selectors
@@ -53,7 +48,7 @@ class Flip(Transform):
             "vertical": vertical,
         }
 
-    def apply_image(self, image: RasterImage, state: dict[str, bool]) -> RasterImage:
+    def apply_image(self, image: torch.Tensor, state: dict[str, bool]) -> torch.Tensor:
         """Apply the sampled state on the specified image.
 
         Args:
@@ -61,9 +56,9 @@ class Flip(Transform):
             state: the sampled state.
         """
         if state["horizontal"]:
-            image.image = torch.flip(image.image, dims=[-1])
+            image = torch.flip(image, dims=[-1])
         if state["vertical"]:
-            image.image = torch.flip(image.image, dims=[-2])
+            image = torch.flip(image, dims=[-2])
         return image
 
     def apply_boxes(

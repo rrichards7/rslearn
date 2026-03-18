@@ -17,7 +17,6 @@ from .data_source import (
     ItemLookupDataSource,
     RetrieveItemDataSource,
 )
-from .direct_materialize_data_source import DirectMaterializeDataSource
 
 __all__ = (
     "DataSource",
@@ -25,6 +24,5 @@ __all__ = (
     "Item",
     "ItemLookupDataSource",
     "RetrieveItemDataSource",
-    "DirectMaterializeDataSource",
     "data_source_from_config",
 )

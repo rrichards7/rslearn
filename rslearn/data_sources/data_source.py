@@ -1,6 +1,5 @@
 """Base classes for rslearn data sources."""
 
-from abc import ABC, abstractmethod
 from collections.abc import Generator
 from typing import Any, BinaryIO, Generic, TypeVar
 
@@ -57,13 +56,12 @@ class Item:
 ItemType = TypeVar("ItemType", bound="Item")
 
 
-class DataSource(ABC, Generic[ItemType]):
+class DataSource(Generic[ItemType]):
     """A set of raster or vector files that can be retrieved.
 
     Data sources should support at least one of ingest and materialize.
     """
 
-    @abstractmethod
     def get_items(
         self, geometries: list[STGeometry], query_config: QueryConfig
     ) -> list[list[list[ItemType]]]:
@@ -78,8 +76,7 @@ class DataSource(ABC, Generic[ItemType]):
         """
         raise NotImplementedError
 
-    @abstractmethod
-    def deserialize_item(self, serialized_item: dict) -> ItemType:
+    def deserialize_item(self, serialized_item: Any) -> ItemType:
         """Deserializes an item from JSON-decoded data."""
         raise NotImplementedError
 
@@ -119,7 +116,6 @@ class DataSource(ABC, Generic[ItemType]):
 class ItemLookupDataSource(DataSource[ItemType]):
     """A data source that can look up items by name."""
 
-    @abstractmethod
     def get_item_by_name(self, name: str) -> ItemType:
         """Gets an item by name."""
         raise NotImplementedError
@@ -128,7 +124,6 @@ class ItemLookupDataSource(DataSource[ItemType]):
 class RetrieveItemDataSource(DataSource[ItemType]):
     """A data source that can retrieve items in their raw format."""
 
-    @abstractmethod
     def retrieve_item(
         self, item: ItemType
     ) -> Generator[tuple[str, BinaryIO], None, None]:

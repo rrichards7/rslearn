@@ -25,11 +25,8 @@ from timm.layers import to_2tuple
 from timm.models.vision_transformer import Block
 from torch.nn import functional as F
 
-from rslearn.train.model_context import ModelContext
 from rslearn.train.transforms.normalize import Normalize
 from rslearn.train.transforms.transform import Transform
-
-from .component import FeatureExtractor, FeatureMaps
 
 logger = logging.getLogger(__name__)
 
@@ -80,10 +77,10 @@ def get_config(cache_dir: Path, hf_hub_id: str, hf_hub_revision: str) -> dict[st
         return json.load(f)["pretrained_cfg"]
 
 
-class PrithviV2(FeatureExtractor):
+class PrithviV2(nn.Module):
     """An Rslearn wrapper for Prithvi 2.0."""
 
-    INPUT_KEY = "image"
+    INPUT_KEY = "sentinel2_l2a"
 
     def __init__(
         self,
@@ -144,15 +141,13 @@ class PrithviV2(FeatureExtractor):
         """Process individual modality data.
 
         Args:
-            data: Input tensor of shape [B, C, T, H, W]
+            data: Input tensor of shape [B, C, H, W]
 
         Returns:
-            list of tensors of shape [B, C, T, H, W]
+            list of tensors of shape [B, C, H, W]
         """
         # Get original dimensions
-        B, C, T, H, W = data.shape
-        data = rearrange(data, "b c t h w -> b (c t) h w")
-        original_height = H
+        original_height = data.shape[2]
         new_height = self.patch_size if original_height == 1 else self.image_resolution
         data = F.interpolate(
             data,
@@ -160,32 +155,34 @@ class PrithviV2(FeatureExtractor):
             mode="bilinear",
             align_corners=False,
         )
-        data = rearrange(data, "b (c t) h w -> b c t h w", c=C, t=T)
         return data
 
-    def forward(self, context: ModelContext) -> FeatureMaps:
+    def forward(self, inputs: list[dict[str, Any]]) -> list[torch.Tensor]:
         """Compute feature maps from the Prithvi V2 backbone.
 
         Args:
-            context: the model context. Input dicts must include "image" key containing
-                HLS (Harmonized Landsat-Sentinel) data.
+            inputs: input dicts that must include "image" key containing HLS
+                (Harmonized Landsat-Sentinel) data.
 
         Returns:
-            a FeatureMaps with one map of shape [B, H/p_s, W/p_s, 11*1024] that contains stacked
-                feature maps across the 11 transformer blocks.
+            11 feature maps (one per transformer block in the Prithvi model),
+            of shape [B, H/p_s, W/p_s, D=1024] where p_s=16 is the patch size.
         """
-        # x has shape BCTHW
-        x = torch.stack([inp[self.INPUT_KEY].image for inp in context.inputs], dim=0)
+        # for inp in inputs:
+            # print("@@@@@@@@@@@ keys: ", inp.keys())
+
+        x = torch.stack([inp[self.INPUT_KEY] for inp in inputs], dim=0)
         x = self._resize_data(x)
+        num_timesteps = x.shape[1] // len(self.bands)
+        x = rearrange(x, "b (t c) h w -> b c t h w", t=num_timesteps)
         features = self.model.encoder.forward_features(x)
         # prepare_features_for_image_model was slightly modified since we already
         # know the number of timesteps and don't need to recompute it.
         # in addition we average along the time dimension (instead of concatenating)
         # to keep the embeddings reasonably sized.
-        result = self.model.encoder.prepare_features_for_image_model(
-            features, x.shape[2]
+        return self.model.encoder.prepare_features_for_image_model(
+            features, num_timesteps
         )
-        return FeatureMaps([torch.cat(result, dim=1)])
 
     def get_backbone_channels(self) -> list:
         """Returns the output channels of this model when used as a backbone.
@@ -230,6 +227,7 @@ class PrithviNormalize(Transform):
         self.normalizer = Normalize(
             mean=config["mean"],
             std=config["std"],
+            num_bands=len(config["mean"]),
             selectors=[PrithviV2.INPUT_KEY],
         )
 
@@ -748,7 +746,7 @@ class PrithviViT(nn.Module):
         # embed patches
         x = self.patch_embed(x)
 
-        pos_embed = self.interpolate_pos_encoding(sample_shape)
+        pos_embed = self.interpolate_pos_encoding(sample_shape).to(x.device)
         # add pos embed w/o cls token
         x = x + pos_embed[:, 1:, :]
 

@@ -8,7 +8,6 @@ from torch.optim.lr_scheduler import (
     CosineAnnealingLR,
     CosineAnnealingWarmRestarts,
     LRScheduler,
-    MultiStepLR,
     ReduceLROnPlateau,
 )
 
@@ -49,20 +48,6 @@ class PlateauScheduler(SchedulerFactory):
         """Build the ReduceLROnPlateau scheduler."""
         super().build(optimizer)
         return ReduceLROnPlateau(optimizer, **self.get_kwargs())
-
-
-@dataclass
-class MultiStepScheduler(SchedulerFactory):
-    """Step learning rate scheduler."""
-
-    milestones: list[int]
-    gamma: float | None = None
-    last_epoch: int | None = None
-
-    def build(self, optimizer: Optimizer) -> LRScheduler:
-        """Build the ReduceLROnPlateau scheduler."""
-        super().build(optimizer)
-        return MultiStepLR(optimizer, **self.get_kwargs())
 
 
 @dataclass

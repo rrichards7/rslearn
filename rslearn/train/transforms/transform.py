@@ -100,49 +100,12 @@ def write_selector(
         d.update(v)
 
 
-def selector_exists(
-    input_dict: dict[str, Any], target_dict: dict[str, Any], selector: str
-) -> bool:
-    """Check if the specified selector exists in the dicts.
-
-    Args:
-        input_dict: the input dict
-        target_dict: the target dict
-        selector: the selector specifying the item to check
-
-    Returns:
-        True if the selector exists, False otherwise
-    """
-    d, selector = get_dict_and_subselector(input_dict, target_dict, selector)
-    parts = selector.split("/") if selector else []
-    cur = d
-    for part in parts:
-        if not isinstance(cur, dict) or part not in cur:
-            return False
-        cur = cur[part]
-    return True
-
-
 class Transform(torch.nn.Module):
     """An rslearn transform.
 
     Provides helper functions for subclasses to select input and target keys and to
     transform them.
-
-    Attributes:
-        skip_missing: If True, selectors that don't exist in the input/target dicts
-            will be silently skipped. Useful when working with optional inputs.
     """
-
-    def __init__(self, skip_missing: bool = False):
-        """Initialize Transform.
-
-        Args:
-            skip_missing: If True, selectors that don't exist in the input/target dicts
-                will be silently skipped. Useful when working with optional inputs.
-        """
-        super().__init__()
-        self.skip_missing = skip_missing
 
     def apply_fn(
         self,
@@ -162,10 +125,6 @@ class Transform(torch.nn.Module):
             kwargs: additional arguments to pass to the function
         """
         for selector in selectors:
-            if self.skip_missing and not selector_exists(
-                input_dict, target_dict, selector
-            ):
-                continue
             v = read_selector(input_dict, target_dict, selector)
             v = fn(v, **kwargs)
             write_selector(input_dict, target_dict, selector, v)

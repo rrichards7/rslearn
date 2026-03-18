@@ -4,10 +4,6 @@ from typing import Any
 
 import torch
 
-from rslearn.train.model_context import ModelContext, ModelOutput
-
-from .component import FeatureExtractor, IntermediateComponent, Predictor
-
 
 class SingleTaskModel(torch.nn.Module):
     """Standard model wrapper.
@@ -18,41 +14,38 @@ class SingleTaskModel(torch.nn.Module):
     outputs and targets from the last module (which also receives the targets).
     """
 
-    def __init__(
-        self,
-        encoder: list[FeatureExtractor | IntermediateComponent],
-        decoder: list[IntermediateComponent | Predictor],
-    ):
+    def __init__(self, encoder: list[torch.nn.Module], decoder: list[torch.nn.Module]):
         """Initialize a new SingleTaskModel.
 
         Args:
-            encoder: modules to compute intermediate feature representations. The first
-                module must be a FeatureExtractor, and following modules must be
-                IntermediateComponents.
-            decoder: modules to compute outputs and loss. The last module must be a
-                Predictor, while the previous modules must be IntermediateComponents.
+            encoder: modules to compute intermediate feature representations.
+            decoder: modules to compute outputs and loss.
         """
         super().__init__()
-        self.encoder = torch.nn.ModuleList(encoder)
+        self.encoder = torch.nn.Sequential(*encoder)
         self.decoder = torch.nn.ModuleList(decoder)
 
     def forward(
         self,
-        context: ModelContext,
+        inputs: list[dict[str, Any]],
         targets: list[dict[str, Any]] | None = None,
-    ) -> ModelOutput:
+    ) -> dict[str, Any]:
         """Apply the sequence of modules on the inputs.
 
         Args:
-            context: the model context.
+            inputs: list of input dicts
             targets: optional list of target dicts
+            info: optional dictionary of info to pass to the last module
 
         Returns:
-            the model output.
+            dict with keys "outputs" and "loss_dict".
         """
-        cur = self.encoder[0](context)
-        for module in self.encoder[1:]:
-            cur = module(cur, context)
+        features = self.encoder(inputs)
+        cur = features
         for module in self.decoder[:-1]:
-            cur = module(cur, context)
-        return self.decoder[-1](cur, context, targets)
+            cur = module(cur, inputs)
+        outputs, loss_dict = self.decoder[-1](cur, inputs, targets)
+        return {
+            "outputs": outputs,
+            "loss_dict": loss_dict,
+        }

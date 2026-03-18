@@ -3,16 +3,15 @@
 import math
 from enum import StrEnum
 from importlib import resources
+from typing import Any
 
 import torch
 import torch.nn.functional as F
 import yaml
 from einops import rearrange, repeat
+from torch import nn
 
 from rslearn.log_utils import get_logger
-from rslearn.train.model_context import ModelContext
-
-from .component import FeatureExtractor, FeatureMaps
 
 logger = get_logger(__name__)
 
@@ -29,7 +28,7 @@ class PanopticonModalities(StrEnum):
     # Add more modalities as needed
 
 
-class Panopticon(FeatureExtractor):
+class Panopticon(nn.Module):
     """Class containing the Panopticon model that can ingest MaskedHeliosSample objects."""
 
     patch_size: int = 14
@@ -139,13 +138,11 @@ class Panopticon(FeatureExtractor):
             "chn_ids": chn_ids,
         }
 
-    def forward(self, context: ModelContext) -> FeatureMaps:
+    def forward(self, inputs: list[dict[str, Any]]) -> list[torch.Tensor]:
         """Forward pass through the panopticon model."""
         batch_inputs = {
-            key: torch.stack(
-                [inp[key].single_ts_to_chw_tensor() for inp in context.inputs], dim=0
-            )
-            for key in context.inputs[0].keys()
+            key: torch.stack([inp[key] for inp in inputs], dim=0)
+            for key in inputs[0].keys()
         }
         panopticon_inputs = self.prepare_input(batch_inputs)
         output_features = self.model.forward_features(panopticon_inputs)[
@@ -157,7 +154,7 @@ class Panopticon(FeatureExtractor):
         output_features = rearrange(
             output_features, "b (h w) d -> b d h w", h=height, w=height
         )
-        return FeatureMaps([output_features])
+        return [output_features]
 
     def get_backbone_channels(self) -> list:
         """Returns the output channels of this model when used as a backbone.

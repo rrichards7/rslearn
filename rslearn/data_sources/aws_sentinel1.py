@@ -2,6 +2,7 @@
 
 import os
 import tempfile
+from typing import Any
 
 import boto3
 from upath import UPath
@@ -77,8 +78,9 @@ class Sentinel1(DataSource, TileStore):
         """Gets an item by name."""
         return self.sentinel1.get_item_by_name(name)
 
-    def deserialize_item(self, serialized_item: dict) -> CopernicusItem:
+    def deserialize_item(self, serialized_item: Any) -> CopernicusItem:
         """Deserializes an item from JSON-decoded data."""
+        assert isinstance(serialized_item, dict)
         return CopernicusItem.deserialize(serialized_item)
 
     def ingest(
@@ -97,7 +99,7 @@ class Sentinel1(DataSource, TileStore):
         for item in items:
             for band in self.bands:
                 band_names = [band]
-                if tile_store.is_raster_ready(item, band_names):
+                if tile_store.is_raster_ready(item.name, band_names):
                     continue
 
                 # Item name is like "S1C_IW_GRDH_1SDV_20250528T172106_20250528T172131_002534_00545C_B433.SAFE".
@@ -126,9 +128,4 @@ class Sentinel1(DataSource, TileStore):
                             f"encountered error while downloading s3://{self.bucket_name}/{blob_path}"
                         )
                         raise
-                    tile_store.write_raster_file(
-                        item,
-                        band_names,
-                        UPath(fname),
-                        time_range=item.geometry.time_range,
-                    )
+                    tile_store.write_raster_file(item.name, band_names, UPath(fname))

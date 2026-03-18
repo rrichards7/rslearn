@@ -1,13 +1,11 @@
 """Entrypoint for the rslearn command-line interface."""
 
 import argparse
-import json
 import multiprocessing
-import os
 import random
 import sys
 import time
-from collections.abc import Callable, Generator
+from collections.abc import Callable
 from datetime import UTC, datetime, timedelta
 from typing import Any, TypeVar
 
@@ -15,27 +13,27 @@ import tqdm
 from rasterio.crs import CRS
 from upath import UPath
 
-from rslearn.config import LayerConfig, StorageConfig
+from rslearn.config import LayerConfig
 from rslearn.const import WGS84_EPSG
 from rslearn.data_sources import Item
 from rslearn.dataset import Dataset, Window, WindowLayerData
 from rslearn.dataset.add_windows import add_windows_from_box, add_windows_from_file
 from rslearn.dataset.handler_summaries import (
+    ErrorOutcome,
     IngestCounts,
     IngestDatasetJobsSummary,
     LayerIngestSummary,
     MaterializeDatasetWindowsSummary,
     PrepareDatasetWindowsSummary,
-    summarize_errors,
+    UnknownIngestCounts,
 )
+from rslearn.dataset.index import DatasetIndex
 from rslearn.dataset.manage import (
     AttemptsCounter,
     materialize_dataset_windows,
     prepare_dataset_windows,
     retry,
 )
-from rslearn.dataset.storage.file import FileWindowStorage
-from rslearn.dataset.storage.migrate import migrate_window_storage
 from rslearn.log_utils import get_logger
 from rslearn.tile_stores import get_tile_store_with_layer
 from rslearn.utils import Projection, STGeometry
@@ -47,12 +45,6 @@ handler_registry = {}
 ItemType = TypeVar("ItemType", bound="Item")
 
 MULTIPROCESSING_CONTEXT = "forkserver"
-MP_CONTEXT_ENV_VAR = "RSLEARN_MULTIPROCESSING_CONTEXT"
-
-# Maximum number of workers when using the default workers=-1 option.
-# Many data sources have rate limits, so this is a sensible default level of maximum
-# parallelism.
-DEFAULT_MAX_WORKERS = 32
 
 
 def register_handler(category: Any, command: str) -> Callable:
@@ -250,70 +242,6 @@ def add_windows() -> None:
     logger.info(f"created {len(windows)} windows")
 
 
-@register_handler("dataset", "migrate")
-def dataset_migrate() -> None:
-    """Handler for the rslearn dataset migrate command."""
-    parser = argparse.ArgumentParser(
-        prog="rslearn dataset migrate",
-        description=(
-            "rslearn dataset migrate: migrate window metadata to another storage backend"
-        ),
-    )
-    parser.add_argument(
-        "--root", type=str, required=True, help="Dataset root directory"
-    )
-    parser.add_argument(
-        "--storage-config",
-        type=str,
-        required=True,
-        help=(
-            "JSON StorageConfig for the target WindowStorageFactory, e.g. "
-            '\'{"class_path":"rslearn.dataset.storage.sqlite.SQLiteWindowStorageFactory","init_args":{}}\''
-        ),
-    )
-    parser.add_argument(
-        "--source-get-windows-kwargs",
-        type=str,
-        default="{}",
-        help=(
-            "Optional JSON kwargs passed to source storage get_windows(), e.g. "
-            '\'{"workers":8,"show_progress":true}\''
-        ),
-    )
-    parser.add_argument(
-        "--fail-if-target-nonempty",
-        type=bool,
-        default=True,
-        action=argparse.BooleanOptionalAction,
-        help=(
-            "Fail if target storage already has windows. "
-            "Use --no-fail-if-target-nonempty to bypass this check."
-        ),
-    )
-    args = parser.parse_args(args=sys.argv[3:])
-
-    storage_config_obj = json.loads(args.storage_config)
-    target_storage_config = StorageConfig.model_validate(storage_config_obj)
-    source_get_windows_kwargs = json.loads(args.source_get_windows_kwargs)
-    if not isinstance(source_get_windows_kwargs, dict):
-        raise ValueError("--source-get-windows-kwargs must decode to a JSON object")
-
-    dataset = Dataset(UPath(args.root))
-    target_storage = (
-        target_storage_config.instantiate_window_storage_factory().get_storage(
-            dataset.path
-        )
-    )
-
-    num_windows = migrate_window_storage(
-        dataset.storage,
-        target_storage,
-        fail_if_target_nonempty=args.fail_if_target_nonempty,
-        source_get_windows_kwargs=source_get_windows_kwargs,
-    )
-    logger.info(f"Migrated {num_windows} windows successfully")
-
-
 def add_apply_on_windows_args(parser: argparse.ArgumentParser) -> None:
     """Add arguments for handlers that use the apply_on_windows helper.
 
@@ -336,11 +264,8 @@ def add_apply_on_windows_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "--workers",
         type=int,
-        default=-1,
-        help=(
-            "Number of worker processes (-1 to use #CPUs capped at "
-            f"{DEFAULT_MAX_WORKERS}, 0 for main process only)"
-        ),
+        default=0,
+        help="Number of worker processes (default 0 to use main process only)",
     )
     parser.add_argument(
         "--load-workers",
@@ -373,28 +298,24 @@ def apply_on_windows(
     dataset: Dataset,
     group: str | list[str] | None = None,
     names: list[str] | None = None,
-    workers: int = -1,
+    workers: int = 0,
     load_workers: int | None = None,
     batch_size: int = 1,
     jobs_per_process: int | None = None,
     use_initial_job: bool = True,
-) -> Generator[Any, None, None]:
+) -> None:
     """A helper to apply a function on windows in a dataset.
-
-    Yields the return value of f for each batch.
 
     Args:
         f: the function to apply on lists of windows.
         dataset: the dataset.
         group: optional, only apply on windows in this group.
         names: optional, only apply on windows with these names.
-        workers: the number of parallel workers to use, default -1 (use number of
-            workers equal to number of available CPUs, capped at DEFAULT_MAX_WORKERS).
+        workers: the number of parallel workers to use, default 0 (main thread only).
         load_workers: optional different number of workers to use for loading the
             windows. If set, workers controls the number of workers to process the
             jobs, while load_workers controls the number of workers to use for reading
-            windows from the rslearn dataset. Workers is only passed if the window
-            storage is FileWindowStorage.
+            windows from the rslearn dataset.
         batch_size: if workers > 0, the maximum number of windows to pass to the
             function.
         jobs_per_process: optional, terminate processes after they have handled this
@@ -404,9 +325,6 @@ def apply_on_windows(
             like building indexes that should not be done in parallel. Set this false
             to disable using the initial job.
     """
-    if workers == -1:
-        workers = min(os.cpu_count() or 1, DEFAULT_MAX_WORKERS)
-
     if hasattr(f, "set_dataset"):
         f.set_dataset(dataset)
 
@@ -418,14 +336,11 @@ def apply_on_windows(
     else:
         groups = group
 
-    # Load the windows. We pass workers and show_progress if it is FileWindowStorage.
-    kwargs: dict[str, Any] = {}
-    if isinstance(dataset.storage, FileWindowStorage):
-        if load_workers is None:
-            load_workers = workers
-        kwargs["workers"] = load_workers
-        kwargs["show_progress"] = True
-    windows = dataset.load_windows(groups=groups, names=names, **kwargs)
+    if load_workers is None:
+        load_workers = workers
+    windows = dataset.load_windows(
+        groups=groups, names=names, workers=load_workers, show_progress=True
+    )
     logger.info(f"found {len(windows)} windows")
 
     if hasattr(f, "get_jobs"):
@@ -438,7 +353,7 @@ def apply_on_windows(
 
     if use_initial_job and len(jobs) > 0:
         # Apply directly on first window to get any initialization out of the way.
-        yield f([jobs[0]])
+        f([jobs[0]])
         jobs = jobs[1:]
 
     batches = []
@@ -447,21 +362,22 @@ def apply_on_windows(
 
     num_batches = len(batches)
     if workers == 0:
+        # Process batches sequentially but with same error handling as parallel
         for batch in tqdm.tqdm(batches, total=num_batches):
-            yield f(batch)
+            f(batch)
     else:
+        # Process batches in parallel
         p = multiprocessing.Pool(processes=workers, maxtasksperchild=jobs_per_process)
         outputs = p.imap_unordered(f, batches)
-        yield from tqdm.tqdm(outputs, total=num_batches)
+        for _ in tqdm.tqdm(outputs, total=num_batches):
+            pass
         p.close()
 
 
-def apply_on_windows_args(
-    f: Callable[..., Any], args: argparse.Namespace
-) -> Generator[Any, None, None]:
+def apply_on_windows_args(f: Callable[..., Any], args: argparse.Namespace) -> None:
     """Call apply_on_windows with arguments passed via command-line interface."""
-    dataset = Dataset(UPath(args.root), disabled_layers=args.disabled_layers)
-    yield from apply_on_windows(
+    dataset = Dataset(UPath(args.root), args.disabled_layers)
+    apply_on_windows(
         f=f,
         dataset=dataset,
         group=args.group,
@@ -480,7 +396,6 @@ class PrepareHandler:
     def __init__(
         self,
         force: bool,
-        ignore_errors: bool = False,
         retry_max_attempts: int = 0,
         retry_backoff: timedelta = timedelta(minutes=1),
     ) -> None:
@@ -488,15 +403,11 @@ class PrepareHandler:
 
         Args:
             force: force prepare
-            ignore_errors: if True, catch errors per-layer and continue. Note that this
-                defaults to False here in case of external use, but True in the CLI
-                argument.
             retry_max_attempts: set greater than zero to retry for this many attempts in
                 case of error.
             retry_backoff: how long to wait before retrying (see retry).
         """
         self.force = force
-        self.ignore_errors = ignore_errors
         self.dataset: Dataset | None = None
         self.retry_max_attempts = retry_max_attempts
         self.retry_backoff = retry_backoff
@@ -518,7 +429,6 @@ class PrepareHandler:
             self.dataset,
             windows,
             self.force,
-            ignore_errors=self.ignore_errors,
             retry_max_attempts=self.retry_max_attempts,
             retry_backoff=self.retry_backoff,
         )
@@ -545,13 +455,6 @@ def dataset_prepare() -> None:
         help="List of layers to disable e.g 'layer1,layer2'",
     )
     parser.add_argument(
-        "--ignore-errors",
-        type=bool,
-        default=True,
-        help="Ignore errors in individual jobs",
-        action=argparse.BooleanOptionalAction,
-    )
-    parser.add_argument(
         "--retry-max-attempts",
         type=int,
         default=0,
@@ -568,44 +471,10 @@ def dataset_prepare() -> None:
 
     fn = PrepareHandler(
         args.force,
-        ignore_errors=args.ignore_errors,
         retry_max_attempts=args.retry_max_attempts,
         retry_backoff=timedelta(seconds=args.retry_backoff_seconds),
     )
-
-    combined: PrepareDatasetWindowsSummary | None = None
-    for summary in apply_on_windows_args(fn, args):
-        if combined is None:
-            combined = summary
-        else:
-            combined = combined.merge(summary)
-
-    if combined is not None:
-        logger.info("=== Prepare Summary ===")
-        logger.info(
-            f"Total windows requested: {combined.total_windows_requested}, "
-            f"duration: {combined.duration_seconds:.1f}s"
-        )
-        has_errors = False
-        for ls in combined.layer_summaries.values():
-            msg = (
-                f"  Layer {ls.layer_name}: "
-                f"prepared={ls.windows_prepared}, "
-                f"skipped={ls.windows_skipped}, "
-                f"rejected={ls.windows_rejected}, "
-                f"failed={ls.windows_failed}"
-            )
-            logger.info(msg)
-            for err_msg, count in summarize_errors(ls.error_messages):
-                logger.info(f"    Error (x{count}): {err_msg}")
-            if ls.error_messages:
-                has_errors = True
-        if has_errors:
-            logger.info(
-                "Some windows failed. Consider enabling retries with: "
-                "--retry-max-attempts 5 --retry-backoff-seconds 5"
-            )
-            logger.info("Or use --no-ignore-errors to quit after the first error.")
+    apply_on_windows_args(fn, args)
 
 
 def _load_window_layer_datas(
@@ -652,7 +521,7 @@ class IngestHandler:
             summary of the ingest jobs operation fit for telemetry purposes.
         """
         start_time = time.monotonic()
-        layer_summaries: dict[str, LayerIngestSummary] = {}
+        layer_summaries: list[LayerIngestSummary] = []
 
         logger.info(f"Running ingest for {len(jobs)} jobs")
         import gc
@@ -678,13 +547,7 @@ class IngestHandler:
             data_source = layer_cfg.instantiate_data_source(self.dataset.path)
 
             attempts_counter = AttemptsCounter()
-            ingest_counts = IngestCounts(
-                items=len(items_and_geometries),
-                geometries=sum(
-                    len(geometries) for _, geometries in items_and_geometries
-                ),
-            )
-            error_messages: list[str] = []
+            ingest_counts: IngestCounts | UnknownIngestCounts
             try:
                 retry(
                     lambda: data_source.ingest(
@@ -698,23 +561,35 @@ class IngestHandler:
                     retry_backoff=self.retry_backoff,
                     attempts_counter=attempts_counter,
                 )
+                ingest_counts = IngestCounts(
+                    items_ingested=len(items_and_geometries),
+                    geometries_ingested=sum(
+                        len(geometries) for _, geometries in items_and_geometries
+                    ),
+                )
             except Exception as e:
                 if not self.ignore_errors:
                     raise
 
-                logger.exception(
-                    f"Error ingesting {len(items_and_geometries)} items "
-                    f"in layer {layer_name}"
+                ingest_counts = UnknownIngestCounts(
+                    items_attempted=len(items_and_geometries),
+                    geometries_attempted=sum(
+                        len(geometries) for _, geometries in items_and_geometries
+                    ),
                 )
-                error_messages.append(str(e))
+                logger.error(
+                    "warning: got error while ingesting "
+                    + f"{len(items_and_geometries)} items: {e}"
+                )
 
-            layer_summaries[layer_name] = LayerIngestSummary(
-                layer_name=layer_name,
-                data_source_name=getattr(layer_cfg.data_source, "name", "N/A"),
-                duration_seconds=time.monotonic() - start_time,
-                ingest_counts=ingest_counts,
-                ingest_attempts=attempts_counter.value,
-                error_messages=error_messages,
+            layer_summaries.append(
+                LayerIngestSummary(
+                    layer_name=layer_name,
+                    data_source_name=getattr(layer_cfg.data_source, "name", "N/A"),
+                    duration_seconds=time.monotonic() - start_time,
+                    ingest_counts=ingest_counts,
+                    ingest_attempts=attempts_counter.value,
+                )
             )
 
         gc.collect()
@@ -805,7 +680,7 @@ def dataset_ingest() -> None:
     parser.add_argument(
         "--ignore-errors",
         type=bool,
-        default=True,
+        default=False,
         help="Ignore ingestion errors in individual jobs",
         action=argparse.BooleanOptionalAction,
     )
@@ -829,39 +704,7 @@ def dataset_ingest() -> None:
         retry_max_attempts=args.retry_max_attempts,
         retry_backoff=timedelta(seconds=args.retry_backoff_seconds),
     )
-
-    combined: IngestDatasetJobsSummary | None = None
-    for summary in apply_on_windows_args(fn, args):
-        if combined is None:
-            combined = summary
-        else:
-            combined = combined.merge(summary)
-
-    if combined is not None:
-        logger.info("=== Ingest Summary ===")
-        logger.info(
-            f"Total jobs: {combined.num_jobs}, "
-            f"duration: {combined.duration_seconds:.1f}s"
-        )
-        has_errors = False
-        for ls in combined.layer_summaries.values():
-            failed = "FAILED" if ls.error_messages else "ok"
-            msg = (
-                f"  Layer {ls.layer_name} [{failed}]: "
-                f"items={ls.ingest_counts.items}, "
-                f"geometries={ls.ingest_counts.geometries}"
-            )
-            logger.info(msg)
-            for err_msg, count in summarize_errors(ls.error_messages):
-                logger.info(f"    Error (x{count}): {err_msg}")
-            if ls.error_messages:
-                has_errors = True
-        if has_errors:
-            logger.info(
-                "Some ingestions failed. Consider enabling retries with: "
-                "--retry-max-attempts 5 --retry-backoff-seconds 5"
-            )
-            logger.info("Or use --no-ignore-errors to quit after the first error.")
+    apply_on_windows_args(fn, args)
 
 
 class MaterializeHandler:
@@ -887,18 +730,27 @@ class MaterializeHandler:
         """
         self.dataset = dataset
 
-    def __call__(self, windows: list[Window]) -> MaterializeDatasetWindowsSummary:
+    def __call__(
+        self, windows: list[Window]
+    ) -> MaterializeDatasetWindowsSummary | ErrorOutcome:
         """Materializes the windows from apply_on_windows."""
         logger.info(f"Running Materialize with {len(windows)} windows")
+        start_time = time.monotonic()
         if self.dataset is None:
             raise ValueError("dataset not set")
-        return materialize_dataset_windows(
-            self.dataset,
-            windows,
-            ignore_errors=self.ignore_errors,
-            retry_max_attempts=self.retry_max_attempts,
-            retry_backoff=self.retry_backoff,
-        )
+        try:
+            return materialize_dataset_windows(
+                self.dataset,
+                windows,
+                retry_max_attempts=self.retry_max_attempts,
+                retry_backoff=self.retry_backoff,
+            )
+        except Exception as e:
+            if not self.ignore_errors:
+                logger.error(f"Error materializing windows: {e}")
+                raise
+            logger.warning(f"Ignoring error while materializing windows: {e}")
+            return ErrorOutcome(duration_seconds=time.monotonic() - start_time)
 
 
 @register_handler("dataset", "materialize")
@@ -920,7 +772,7 @@ def dataset_materialize() -> None:
     parser.add_argument(
         "--ignore-errors",
         type=bool,
-        default=True,
+        default=False,
         help="Ignore errors in individual jobs",
         action=argparse.BooleanOptionalAction,
     )
@@ -943,38 +795,36 @@ def dataset_materialize() -> None:
         retry_max_attempts=args.retry_max_attempts,
         retry_backoff=timedelta(seconds=args.retry_backoff_seconds),
     )
+    apply_on_windows_args(fn, args)
 
-    combined: MaterializeDatasetWindowsSummary | None = None
-    for summary in apply_on_windows_args(fn, args):
-        if combined is None:
-            combined = summary
-        else:
-            combined = combined.merge(summary)
 
-    if combined is not None:
-        logger.info("=== Materialize Summary ===")
-        logger.info(
-            f"Total windows requested: {combined.total_windows_requested}, "
-            f"duration: {combined.duration_seconds:.1f}s"
-        )
-        has_errors = False
-        for ls in combined.layer_summaries.values():
-            msg = (
-                f"  Layer {ls.layer_name}: "
-                f"materialized={ls.num_windows_materialized}, "
-                f"failed={ls.windows_failed}"
-            )
-            logger.info(msg)
-            for err_msg, count in summarize_errors(ls.error_messages):
-                logger.info(f"    Error (x{count}): {err_msg}")
-            if ls.error_messages:
-                has_errors = True
-        if has_errors:
-            logger.info(
-                "Some windows failed to materialize. Consider enabling retries with: "
-                "--retry-max-attempts 5 --retry-backoff-seconds 5"
-            )
-            logger.info("Or use --no-ignore-errors to quit after the first error.")
+@register_handler("dataset", "build_index")
+def dataset_build_index() -> None:
+    """Handler for the rslearn dataset build_index command."""
+    parser = argparse.ArgumentParser(
+        prog="rslearn dataset build_index",
+        description=("rslearn dataset build_index: " + "create a dataset index file"),
+    )
+    parser.add_argument(
+        "--root",
+        type=str,
+        required=True,
+        help="Dataset path",
+    )
+    parser.add_argument(
+        "--workers",
+        type=int,
+        default=16,
+        help="Number of workers",
+    )
+    args = parser.parse_args(args=sys.argv[3:])
+    ds_path = UPath(args.root)
+    dataset = Dataset(ds_path)
+    index = DatasetIndex.build_index(
+        dataset=dataset,
+        workers=args.workers,
+    )
+    index.save_index(ds_path)
 
 
 @register_handler("model", "fit")
@@ -1012,8 +862,7 @@ def model_predict() -> None:
 def main() -> None:
     """CLI entrypoint."""
     try:
-        mp_context = os.environ.get(MP_CONTEXT_ENV_VAR, MULTIPROCESSING_CONTEXT)
-        multiprocessing.set_start_method(mp_context)
+        multiprocessing.set_start_method(MULTIPROCESSING_CONTEXT)
     except RuntimeError as e:
         logger.error(
             f"Multiprocessing context already set to {multiprocessing.get_context()}: "

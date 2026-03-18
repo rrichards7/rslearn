@@ -11,8 +11,6 @@ from enum import Enum
 from typing import Any, BinaryIO
 
 import boto3
-import botocore
-import botocore.client
 import dateutil.parser
 import fiona
 import fiona.transform
@@ -28,7 +26,6 @@ from rslearn.const import SHAPEFILE_AUX_EXTENSIONS, WGS84_EPSG, WGS84_PROJECTION
 from rslearn.tile_stores import TileStoreWithLayer
 from rslearn.utils import GridIndex, Projection, STGeometry, daterange
 from rslearn.utils.fsspec import get_upath_local, join_upath, open_atomic
-from rslearn.utils.raster_array import RasterArray
 from rslearn.utils.raster_format import get_raster_projection_and_bounds
 
 from .copernicus import get_harmonize_callback, get_sentinel2_tiles
@@ -319,8 +316,9 @@ class Naip(DataSource):
             groups.append(cur_groups)
         return groups
 
-    def deserialize_item(self, serialized_item: dict) -> NaipItem:
+    def deserialize_item(self, serialized_item: Any) -> NaipItem:
         """Deserializes an item from JSON-decoded data."""
+        assert isinstance(serialized_item, dict)
         return NaipItem.deserialize(serialized_item)
 
     def ingest(
@@ -338,7 +336,7 @@ class Naip(DataSource):
         """
         for item in items:
             bands = ["R", "G", "B", "IR"]
-            if tile_store.is_raster_ready(item, bands):
+            if tile_store.is_raster_ready(item.name, bands):
                 continue
 
             with tempfile.TemporaryDirectory() as tmp_dir:
@@ -346,9 +344,7 @@ class Naip(DataSource):
                 self.bucket.download_file(
                     item.blob_path, fname, ExtraArgs={"RequestPayer": "requester"}
                 )
-                tile_store.write_raster_file(
-                    item, bands, UPath(fname), time_range=item.geometry.time_range
-                )
+                tile_store.write_raster_file(item.name, bands, UPath(fname))
 
 
 class Sentinel2Modality(Enum):
@@ -409,8 +405,7 @@ class Sentinel2(
     See https://aws.amazon.com/marketplace/pp/prodview-2ostsvrguftb2 for details about
     the buckets.
 
-    The buckets were previously requester pays but now appear to allow anonymous/free
-    access, so AWS credentials are not needed.
+    AWS credentials must be configured for use with boto3.
     """
 
     bucket_names = {
@@ -483,9 +478,7 @@ class Sentinel2(
         self.harmonize = harmonize
 
         bucket_name = self.bucket_names[modality]
-        self.bucket = boto3.resource(
-            "s3", config=botocore.client.Config(signature_version=botocore.UNSIGNED)
-        ).Bucket(bucket_name)
+        self.bucket = boto3.resource("s3").Bucket(bucket_name)
 
     def _read_products(
         self, needed_cell_months: set[tuple[str, int, int]]
@@ -512,11 +505,15 @@ class Sentinel2(
                 )
 
                 products = []
-                for obj in self.bucket.objects.filter(Prefix=prefix):
+                for obj in self.bucket.objects.filter(
+                    Prefix=prefix, RequestPayer="requester"
+                ):
                     if not obj.key.endswith("tileInfo.json"):
                         continue
                     buf = io.BytesIO()
-                    self.bucket.download_fileobj(obj.key, buf)
+                    self.bucket.download_fileobj(
+                        obj.key, buf, ExtraArgs={"RequestPayer": "requester"}
+                    )
                     buf.seek(0)
                     product = json.load(buf)
                     if "tileDataGeometry" not in product:
@@ -641,8 +638,9 @@ class Sentinel2(
                 return item
         raise ValueError(f"item {name} not found")
 
-    def deserialize_item(self, serialized_item: dict) -> Sentinel2Item:
+    def deserialize_item(self, serialized_item: Any) -> Sentinel2Item:
         """Deserializes an item from JSON-decoded data."""
+        assert isinstance(serialized_item, dict)
         return Sentinel2Item.deserialize(serialized_item)
 
     def retrieve_item(
@@ -651,7 +649,9 @@ class Sentinel2(
         """Retrieves the rasters corresponding to an item as file streams."""
         for fname, _ in self.band_fnames[self.modality]:
             buf = io.BytesIO()
-            self.bucket.download_fileobj(item.blob_path + fname, buf)
+            self.bucket.download_fileobj(
+                item.blob_path + fname, buf, ExtraArgs={"RequestPayer": "requester"}
+            )
             buf.seek(0)
             yield (fname, buf)
 
@@ -677,7 +677,9 @@ class Sentinel2(
             f"products/{ts.year}/{ts.month}/{ts.day}/{item.name}/metadata.xml"
         )
         buf = io.BytesIO()
-        self.bucket.download_fileobj(metadata_fname, buf)
+        self.bucket.download_fileobj(
+            metadata_fname, buf, ExtraArgs={"RequestPayer": "requester"}
+        )
         buf.seek(0)
         tree: ET.ElementTree[ET.Element[str]] = ET.ElementTree(
             ET.fromstring(buf.getvalue())
@@ -699,7 +701,7 @@ class Sentinel2(
         """
         for item in items:
             for fname, band_names in self.band_fnames[self.modality]:
-                if tile_store.is_raster_ready(item, band_names):
+                if tile_store.is_raster_ready(item.name, band_names):
                     continue
 
                 with tempfile.TemporaryDirectory() as tmp_dir:
@@ -709,6 +711,7 @@ class Sentinel2(
                         self.bucket.download_file(
                             item.blob_path + fname,
                             local_fname,
+                            ExtraArgs={"RequestPayer": "requester"},
                         )
                     except Exception as e:
                         # TODO: sometimes for some reason object doesn't exist
@@ -729,20 +732,10 @@ class Sentinel2(
                             projection, bounds = get_raster_projection_and_bounds(src)
                         array = harmonize_callback(array)
                         tile_store.write_raster(
-                            item,
-                            band_names,
-                            projection,
-                            bounds,
-                            RasterArray(
-                                chw_array=array,
-                                time_range=item.geometry.time_range,
-                            ),
+                            item.name, band_names, projection, bounds, array
                         )
 
                     else:
                         tile_store.write_raster_file(
-                            item,
-                            band_names,
-                            UPath(local_fname),
-                            time_range=item.geometry.time_range,
+                            item.name, band_names, UPath(local_fname)
                         )

@@ -80,7 +80,7 @@ class WorldPop(LocalFiles):
         worldpop_upath.mkdir(parents=True, exist_ok=True)
         self.download_worldpop_data(worldpop_upath, timeout)
         super().__init__(
-            src_dir=worldpop_upath.absolute().as_uri(),
+            src_dir=worldpop_upath,
             layer_type=LayerType.RASTER,
             context=context,
         )

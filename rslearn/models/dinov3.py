@@ -13,11 +13,8 @@ import torch
 import torchvision
 from einops import rearrange
 
-from rslearn.train.model_context import ModelContext
 from rslearn.train.transforms.normalize import Normalize
 from rslearn.train.transforms.transform import Transform
-
-from .component import FeatureExtractor, FeatureMaps
 
 
 class DinoV3Models(StrEnum):
@@ -43,7 +40,7 @@ DINOV3_PTHS: dict[str, str] = {
 }
 
 
-class DinoV3(FeatureExtractor):
+class DinoV3(torch.nn.Module):
     """DinoV3 Backbones.
 
     Must have the pretrained weights downloaded in checkpoint_dir for them to be loaded.
@@ -94,19 +91,16 @@ class DinoV3(FeatureExtractor):
         self.do_resizing = do_resizing
         self.model = self._load_model(size, checkpoint_dir)
 
-    def forward(self, context: ModelContext) -> FeatureMaps:
+    def forward(self, inputs: list[dict[str, Any]]) -> list[torch.Tensor]:
         """Forward pass for the dinov3 model.
 
         Args:
-            context: the model context. Input dicts must include "image" key.
+            inputs: input dicts that must include "image" key.
 
         Returns:
-            a FeatureMaps with one feature map.
+            List[torch.Tensor]: Single-scale feature tensors from the encoder.
         """
-        cur = torch.stack(
-            [inp["image"].single_ts_to_chw_tensor() for inp in context.inputs],
-            dim=0,
-        )  # (B, C, H, W)
+        cur = torch.stack([inp["image"] for inp in inputs], dim=0)  # (B, C, H, W)
 
         if self.do_resizing and (
             cur.shape[2] != self.image_size or cur.shape[3] != self.image_size
@@ -124,7 +118,7 @@ class DinoV3(FeatureExtractor):
             height, width = int(num_patches**0.5), int(num_patches**0.5)
             features = rearrange(features, "b (h w) d -> b d h w", h=height, w=width)
 
-        return FeatureMaps([features])
+        return [features]
 
     def get_backbone_channels(self) -> list:
         """Returns the output channels of this model when used as a backbone.
@@ -159,6 +153,7 @@ class DinoV3Normalize(Transform):
         self.normalize = Normalize(
             [value * 255 for value in mean],
             [value * 255 for value in std],
+            num_bands=3,
         )
 
     def forward(

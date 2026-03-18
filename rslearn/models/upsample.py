@@ -1,18 +1,9 @@
 """An upsampling layer."""
 
-from typing import Any
-
 import torch
 
-from rslearn.train.model_context import ModelContext
 
-from .component import (
-    FeatureMaps,
-    IntermediateComponent,
-)
-
-
-class Upsample(IntermediateComponent):
+class Upsample(torch.nn.Module):
     """Upsamples each input feature map by the same factor."""
 
     def __init__(
@@ -29,20 +20,16 @@ class Upsample(IntermediateComponent):
         super().__init__()
         self.layer = torch.nn.Upsample(scale_factor=scale_factor, mode=mode)
 
-    def forward(self, intermediates: Any, context: ModelContext) -> FeatureMaps:
-        """Upsample each feature map by scale_factor.
+    def forward(
+        self, features: list[torch.Tensor], inputs: list[torch.Tensor]
+    ) -> list[torch.Tensor]:
+        """Upsample each feature map.
 
         Args:
-            intermediates: the output from the previous component, which must be a FeatureMaps.
-            context: the model context.
+            features: list of feature maps at different resolutions.
+            inputs: original inputs (ignored).
 
         Returns:
-            upsampled feature maps.
+            upsampled feature maps
         """
-        if not isinstance(intermediates, FeatureMaps):
-            raise ValueError("input to Upsample must be a FeatureMaps")
-
-        upsampled_feat_maps = [
-            self.layer(feat_map) for feat_map in intermediates.feature_maps
-        ]
-        return FeatureMaps(upsampled_feat_maps)
+        return [self.layer(feat_map) for feat_map in features]

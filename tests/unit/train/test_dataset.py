@@ -1,49 +1,121 @@
 """Unit tests for rslearn.train.dataset."""
 
 import json
-import random
-import warnings
-from collections.abc import Callable
-from datetime import datetime, timedelta
-from unittest.mock import MagicMock
+import pathlib
 
 import numpy as np
+import numpy.typing as npt
 import pytest
-import torch
+import shapely
 import torch.utils.data
 from upath import UPath
 
-from rslearn.config import (
-    BandSetConfig,
-    DataSourceConfig,
-    DType,
-    LayerConfig,
-    LayerType,
-    QueryConfig,
-    SpaceMode,
-)
 from rslearn.const import WGS84_PROJECTION
 from rslearn.dataset import Dataset, Window
+from rslearn.train.all_patches_dataset import (
+    InMemoryAllPatchesDataset,
+    IterableAllPatchesDataset,
+)
 from rslearn.train.dataset import (
     DataInput,
-    IndexMode,
     ModelDataset,
     RetryDataset,
     SplitConfig,
-    check_window,
-    compute_expected_timestamps,
-    read_data_input,
 )
-from rslearn.train.dataset_index import INDEX_DIR_NAME
-from rslearn.train.model_context import RasterImage
 from rslearn.train.tasks.classification import ClassificationTask
 from rslearn.train.transforms.concatenate import Concatenate
-from rslearn.utils.raster_array import RasterArray
+from rslearn.utils.feature import Feature
+from rslearn.utils.geometry import PixelBounds, STGeometry
 from rslearn.utils.raster_format import GeotiffRasterFormat
+from rslearn.utils.vector_format import GeojsonVectorFormat
 
 
 class TestException(Exception):
     pass
+
+
+@pytest.fixture
+def basic_classification_dataset(tmp_path: pathlib.Path) -> Dataset:
+    """Create an empty dataset setup for image classification."""
+    ds_path = UPath(tmp_path)
+    dataset_config = {
+        "layers": {
+            "image_layer1": {
+                "type": "raster",
+                "band_sets": [
+                    {
+                        "dtype": "uint8",
+                        "bands": ["band"],
+                    }
+                ],
+            },
+            "image_layer2": {
+                "type": "raster",
+                "band_sets": [
+                    {
+                        "dtype": "uint8",
+                        "bands": ["band"],
+                    }
+                ],
+            },
+            "vector_layer": {"type": "vector"},
+        },
+    }
+    ds_path.mkdir(parents=True, exist_ok=True)
+    with (ds_path / "config.json").open("w") as f:
+        json.dump(dataset_config, f)
+    return Dataset(ds_path)
+
+
+def add_window(
+    dataset: Dataset,
+    name: str = "default",
+    group: str = "default",
+    images: dict[tuple[str, int], npt.NDArray] = {},
+    bounds: PixelBounds = (0, 0, 4, 4),
+) -> Window:
+    """Add a window to the dataset.
+
+    Args:
+        dataset: the dataset to add to.
+        name: the name of the window.
+        group: the group of the window.
+        images: map from (layer_name, group_idx) to the image content, which should be
+            1x4x4 since that is the window size.
+    """
+    window_path = Window.get_window_root(dataset.path, group, name)
+    window = Window(
+        path=window_path,
+        name=name,
+        group=group,
+        projection=WGS84_PROJECTION,
+        bounds=bounds,
+        time_range=None,
+    )
+    window.save()
+
+    for (layer_name, group_idx), image in images.items():
+        raster_dir = window.get_raster_dir(layer_name, ["band"], group_idx=group_idx)
+        GeotiffRasterFormat().encode_raster(
+            raster_dir, window.projection, window.bounds, image
+        )
+        window.mark_layer_completed(layer_name, group_idx=group_idx)
+
+    # Add label.
+    feature = Feature(
+        STGeometry(window.projection, shapely.box(*bounds), None),
+        {
+            "label": 1,
+        },
+    )
+    layer_dir = window.get_layer_dir("vector_layer")
+    GeojsonVectorFormat().encode_vector(
+        layer_dir,
+        [feature],
+    )
+    window.mark_layer_completed("vector_layer")
+
+    return window
 
 
 class DummyTestDataset(torch.utils.data.Dataset):
@@ -81,14 +153,85 @@ def test_retry_dataset() -> None:
             pass
 
 
-def test_basic_time_series(
-    basic_classification_dataset: Dataset,
-    add_window_to_basic_classification_dataset: Callable,
-) -> None:
+def test_dataset_covers_border(image_to_class_dataset: Dataset) -> None:
+    # Make sure that, when loading all patches, the border of the raster is included in
+    # the generated windows.
+    # The image_to_class_dataset window is 4x4 so 3x3 patch will ensure irregular window
+    # at the border.
+    patch_size = 3
+    split_config = SplitConfig(
+        patch_size=patch_size,
+        load_all_patches=True,
+    )
+    image_data_input = DataInput("raster", ["image"], bands=["band"], passthrough=True)
+    target_data_input = DataInput("vector", ["label"])
+    task = ClassificationTask("label", ["cls0", "cls1"], read_class_id=True)
+    model_dataset = ModelDataset(
+        image_to_class_dataset,
+        split_config=split_config,
+        task=task,
+        workers=1,
+        inputs={
+            "image": image_data_input,
+            "targets": target_data_input,
+        },
+    )
+    dataset = IterableAllPatchesDataset(model_dataset, (patch_size, patch_size))
+
+    point_coverage = {}
+    for col in range(4):
+        for row in range(4):
+            point_coverage[(col, row)] = False
+
+    # There should be 4 windows with top-left at:
+    # - (0, 0)
+    # - (0, 1)
+    # - (1, 0)
+    # - (1, 1)
+    assert len(list(dataset)) == 4
+
+    for _, _, metadata in dataset:
+        bounds = metadata["bounds"]
+        for col, row in list(point_coverage.keys()):
+            if col < bounds[0] or col >= bounds[2]:
+                continue
+            if row < bounds[1] or row >= bounds[3]:
+                continue
+            point_coverage[(col, row)] = True
+
+    assert all(point_coverage.values())
+
+    # Test with overlap_ratio=0.5 for 2x2 patches
+    dataset_with_overlap = IterableAllPatchesDataset(
+        model_dataset, (2, 2), overlap_ratio=0.5
+    )
+
+    point_coverage = {}
+    for col in range(4):
+        for row in range(4):
+            point_coverage[(col, row)] = False
+
+    # With overlap_ratio=0.5, there should be 9 windows given that overlap is 1 pixel.
+    assert len(list(dataset_with_overlap)) == 9
+
+    for _, _, metadata in dataset:
+        bounds = metadata["bounds"]
+
+        for col, row in list(point_coverage.keys()):
+            if col < bounds[0] or col >= bounds[2]:
+                continue
+            if row < bounds[1] or row >= bounds[3]:
+                continue
+            point_coverage[(col, row)] = True
+
+    assert all(point_coverage.values())
+
+
+def test_basic_time_series(basic_classification_dataset: Dataset) -> None:
     # Create a window with two images in the first layer to make sure we will be able
     # to load it when explicitly adding a DataInput for it.
     image = np.zeros((1, 4, 4), dtype=np.uint8)
-    add_window_to_basic_classification_dataset(
+    add_window(
         basic_classification_dataset,
         images={
             ("image_layer1", 0): image,
@@ -105,8 +248,6 @@ def test_basic_time_series(
                         "image1": [],
                     },
                     "image",
-                    # concatenate on the time dimension
-                    concatenate_dim=1,
                 )
             ],
         ),
@@ -125,18 +266,15 @@ def test_basic_time_series(
 
     assert len(dataset) == 1
     inputs, _, _ = dataset[0]
-    assert inputs["image"].image.shape == (1, 2, 4, 4)
+    assert inputs["image"].shape == (2, 4, 4)
 
 
-def test_load_all_layers(
-    basic_classification_dataset: Dataset,
-    add_window_to_basic_classification_dataset: Callable,
-) -> None:
+def test_load_all_layers(basic_classification_dataset: Dataset) -> None:
     """Make sure we can load a time series by using load_all_layers option."""
     # Create a window with two images in the first layer to make sure we will be able
     # to load it when explicitly adding a DataInput for it.
     image = np.zeros((1, 4, 4), dtype=np.uint8)
-    add_window_to_basic_classification_dataset(
+    add_window(
         basic_classification_dataset,
         images={
             ("image_layer1", 0): image,
@@ -163,20 +301,16 @@ def test_load_all_layers(
 
     assert len(dataset) == 1
     inputs, _, _ = dataset[0]
-    # two layers - timesteps - have been loaded
-    assert inputs["image"].image.shape == (1, 2, 4, 4)
+    assert inputs["image"].shape == (2, 4, 4)
 
 
-def test_load_two_layers(
-    basic_classification_dataset: Dataset,
-    add_window_to_basic_classification_dataset: Callable,
-) -> None:
+def test_load_two_layers(basic_classification_dataset: Dataset) -> None:
     """Make sure when load_all_layers is passed we load all of the layer options."""
     # We create a window with two images in the first layer and one image in the second
     # layer. Then in the DataInput we only refer to the second image in the first layer
     # and the only image in the second layer. With load_all_layers but not
     # load_all_item_groups, just these two images should be read.
-    add_window_to_basic_classification_dataset(
+    add_window(
         basic_classification_dataset,
         images={
             ("image_layer1", 0): 0 * np.ones((1, 4, 4), dtype=np.uint8),
@@ -203,906 +337,127 @@ def test_load_two_layers(
 
     assert len(dataset) == 1
     inputs, _, _ = dataset[0]
-    assert inputs["image"].image.shape == (1, 2, 4, 4)
-    assert torch.all(inputs["image"].image[:, 0] == 1)
-    assert torch.all(inputs["image"].image[:, 1] == 2)
-
-
-def test_read_data_input_timestamps(tmp_path: UPath) -> None:
-    """Test that read_data_input reads timestamps from RasterArrays and stacks them.
-
-    Creates two item groups for the same layer, each with a distinct timestamp.
-    With load_all_layers + load_all_item_groups, both should be read and the
-    timestamps should be concatenated in the returned RasterImage.
-    """
-    ds_path = UPath(tmp_path)
-    ds_path.mkdir(parents=True, exist_ok=True)
-
-    dataset_config = {
-        "layers": {
-            "image": {
-                "type": "raster",
-                "band_sets": [
-                    {
-                        "dtype": "uint8",
-                        "bands": ["band"],
-                    }
-                ],
-            },
-        },
-    }
-    with (ds_path / "config.json").open("w") as f:
-        json.dump(dataset_config, f)
-
-    dataset = Dataset(ds_path)
-
-    window = Window(
-        storage=dataset.storage,
-        name="test_window",
-        group="default",
-        projection=WGS84_PROJECTION,
-        bounds=(0, 0, 4, 4),
-        time_range=None,
-    )
-    window.save()
-
-    ts1 = (datetime(2024, 1, 5), datetime(2024, 1, 10))
-    ts2 = (datetime(2024, 1, 15), datetime(2024, 1, 20))
-
-    image1 = np.ones((1, 4, 4), dtype=np.uint8)
-    raster_dir1 = window.get_raster_dir("image", ["band"], group_idx=0)
-    GeotiffRasterFormat().encode_raster(
-        raster_dir1,
-        window.projection,
-        window.bounds,
-        RasterArray(chw_array=image1, time_range=ts1),
-    )
-
-    image2 = 2 * np.ones((1, 4, 4), dtype=np.uint8)
-    raster_dir2 = window.get_raster_dir("image", ["band"], group_idx=1)
-    GeotiffRasterFormat().encode_raster(
-        raster_dir2,
-        window.projection,
-        window.bounds,
-        RasterArray(chw_array=image2, time_range=ts2),
-    )
-
-    window.mark_layer_completed("image", group_idx=0)
-    window.mark_layer_completed("image", group_idx=1)
-
-    data_input = DataInput(
-        "raster",
-        ["image"],
-        bands=["band"],
-        load_all_layers=True,
-        load_all_item_groups=True,
-    )
-
-    result = read_data_input(
-        dataset, window, window.bounds, data_input, random.Random(0)
-    )
-
-    assert isinstance(result, RasterImage)
-    assert result.image.shape == (1, 2, 4, 4)
-    # image1 was 1 everywhere.
-    assert torch.all(result.image[:, 0] == 1)
-    # image2 was 2 everywhere, it is second item group so should get stacked to the
-    # second timestep.
-    assert torch.all(result.image[:, 1] == 2)
-    # RasterArray should have the stacked timestamps as well.
-    assert result.timestamps == [ts1, ts2]
-
-
-def test_read_data_input_use_all_bands_single_band_set(tmp_path: UPath) -> None:
-    """Band set index option should resolve all bands from that band set."""
-    ds_path = UPath(tmp_path)
-    ds_path.mkdir(parents=True, exist_ok=True)
-
-    dataset_config = {
-        "layers": {
-            "embeddings": {
-                "type": "raster",
-                "band_sets": [
-                    {
-                        "dtype": "float32",
-                        "num_bands": 3,
-                    }
-                ],
-            },
-        },
-    }
-    with (ds_path / "config.json").open("w") as f:
-        json.dump(dataset_config, f)
-
-    dataset = Dataset(ds_path)
-    window = Window(
-        storage=dataset.storage,
-        name="test_window",
-        group="default",
-        projection=WGS84_PROJECTION,
-        bounds=(0, 0, 4, 4),
-        time_range=None,
-    )
-    window.save()
-
-    raster = np.stack(
-        [
-            0 * np.ones((4, 4), dtype=np.float32),
-            1 * np.ones((4, 4), dtype=np.float32),
-            2 * np.ones((4, 4), dtype=np.float32),
-        ],
-        axis=0,
-    )
-    raster_dir = window.get_raster_dir("embeddings", ["B0", "B1", "B2"], group_idx=0)
-    GeotiffRasterFormat().encode_raster(
-        raster_dir,
-        window.projection,
-        window.bounds,
-        RasterArray(chw_array=raster),
-    )
-    window.mark_layer_completed("embeddings", group_idx=0)
-
-    data_input = DataInput(
-        "raster",
-        ["embeddings"],
-        use_all_bands_in_order_of_band_set_idx=0,
-        dtype=DType.FLOAT32,
-    )
-
-    result = read_data_input(
-        dataset, window, window.bounds, data_input, random.Random(0)
-    )
-    assert isinstance(result, RasterImage)
-    assert result.image.shape == (3, 1, 4, 4)
-    torch.testing.assert_close(result.image[:, 0], torch.as_tensor(raster))
-
-
-def test_data_input_requires_bands_or_band_set_idx() -> None:
-    """Missing both explicit bands and band-set index should fail clearly."""
-    with pytest.raises(ValueError, match="one of"):
-        DataInput(
-            data_type="raster",
-            layers=["embeddings"],
-            dtype=DType.FLOAT32,
-        )
-
-
-def test_read_data_input_use_all_bands_with_band_set_index(tmp_path: UPath) -> None:
-    """Band set index should select a specific band set."""
-    ds_path = UPath(tmp_path)
-    ds_path.mkdir(parents=True, exist_ok=True)
-
-    dataset_config = {
-        "layers": {
-            "embeddings": {
-                "type": "raster",
-                "band_sets": [
-                    {"dtype": "float32", "bands": ["unused"]},
-                    {"dtype": "float32", "num_bands": 3},
-                ],
-            },
-        },
-    }
-    with (ds_path / "config.json").open("w") as f:
-        json.dump(dataset_config, f)
-
-    dataset = Dataset(ds_path)
-    window = Window(
-        storage=dataset.storage,
-        name="test_window",
-        group="default",
-        projection=WGS84_PROJECTION,
-        bounds=(0, 0, 4, 4),
-        time_range=None,
-    )
-    window.save()
-
-    raster = np.stack(
-        [
-            10 * np.ones((4, 4), dtype=np.float32),
-            20 * np.ones((4, 4), dtype=np.float32),
-            30 * np.ones((4, 4), dtype=np.float32),
-        ],
-        axis=0,
-    )
-    raster_dir = window.get_raster_dir("embeddings", ["B0", "B1", "B2"], group_idx=0)
-    GeotiffRasterFormat().encode_raster(
-        raster_dir,
-        window.projection,
-        window.bounds,
-        RasterArray(chw_array=raster),
-    )
-    window.mark_layer_completed("embeddings", group_idx=0)
-
-    data_input = DataInput(
-        "raster",
-        ["embeddings"],
-        use_all_bands_in_order_of_band_set_idx=1,
-        dtype=DType.FLOAT32,
-    )
-
-    result = read_data_input(
-        dataset, window, window.bounds, data_input, random.Random(0)
-    )
-    assert isinstance(result, RasterImage)
-    assert result.image.shape == (3, 1, 4, 4)
-    torch.testing.assert_close(result.image[:, 0], torch.as_tensor(raster))
-
-
-def test_model_dataset_index_uses_cache(
-    basic_classification_dataset: Dataset,
-    add_window_to_basic_classification_dataset: Callable,
-) -> None:
-    """Test that index_mode=USE actually uses cached results.
-
-    Creates an index, then adds a new window. With USE mode, the cached
-    index should be returned (not including the new window).
-    """
-    image = np.zeros((1, 4, 4), dtype=np.uint8)
-    add_window_to_basic_classification_dataset(
-        basic_classification_dataset,
-        name="window1",
-        images={("image_layer1", 0): image},
-    )
-    add_window_to_basic_classification_dataset(
-        basic_classification_dataset,
-        name="window2",
-        images={("image_layer1", 0): image},
-    )
-
-    inputs = {
-        "image": DataInput("raster", ["image_layer1"], bands=["band"]),
-        "targets": DataInput("vector", ["vector_layer"]),
-    }
-    task = ClassificationTask("label", ["cls0", "cls1"], read_class_id=True)
-    split_config = SplitConfig()
-
-    # First run: create index
-    dataset1 = ModelDataset(
-        basic_classification_dataset,
-        split_config=split_config,
-        task=task,
-        workers=0,
-        inputs=inputs,
-        index_mode=IndexMode.USE,
-    )
-    assert len(dataset1) == 2
-
-    # Add a new window AFTER the index was created
-    add_window_to_basic_classification_dataset(
-        basic_classification_dataset,
-        name="window3",
-        images={("image_layer1", 0): image},
-    )
-
-    # Second run: should still return 2 windows (proving cache is used)
-    dataset2 = ModelDataset(
-        basic_classification_dataset,
-        split_config=split_config,
-        task=task,
-        workers=0,
-        inputs=inputs,
-        index_mode=IndexMode.USE,
-    )
-    assert len(dataset2) == 2  # Still 2, not 3
-
-
-def test_model_dataset_index_refresh_rebuilds(
-    basic_classification_dataset: Dataset,
-    add_window_to_basic_classification_dataset: Callable,
-) -> None:
-    """Test that index_mode=REFRESH rebuilds the index.
-
-    Creates an index, adds a new window, then uses REFRESH mode.
-    The refreshed index should include the new window.
-    """
-    image = np.zeros((1, 4, 4), dtype=np.uint8)
-    add_window_to_basic_classification_dataset(
-        basic_classification_dataset,
-        name="window1",
-        images={("image_layer1", 0): image},
-    )
-    add_window_to_basic_classification_dataset(
-        basic_classification_dataset,
-        name="window2",
-        images={("image_layer1", 0): image},
-    )
-
-    inputs = {
-        "image": DataInput("raster", ["image_layer1"], bands=["band"]),
-        "targets": DataInput("vector", ["vector_layer"]),
-    }
-    task = ClassificationTask("label", ["cls0", "cls1"], read_class_id=True)
-    split_config = SplitConfig()
-
-    # First run: create index
-    dataset1 = ModelDataset(
-        basic_classification_dataset,
-        split_config=split_config,
-        task=task,
-        workers=0,
-        inputs=inputs,
-        index_mode=IndexMode.USE,
-    )
-    assert len(dataset1) == 2
-
-    # Add a new window AFTER the index was created
-    add_window_to_basic_classification_dataset(
-        basic_classification_dataset,
-        name="window3",
-        images={("image_layer1", 0): image},
-    )
-
-    # Refresh: should now include window3
-    dataset2 = ModelDataset(
-        basic_classification_dataset,
-        split_config=split_config,
-        task=task,
-        workers=0,
-        inputs=inputs,
-        index_mode=IndexMode.REFRESH,
-    )
-    assert len(dataset2) == 3  # Now 3, because we refreshed the index
-
-
-def test_model_dataset_without_index(
-    basic_classification_dataset: Dataset,
-    add_window_to_basic_classification_dataset: Callable,
-) -> None:
-    """Test that ModelDataset works correctly with index_mode=OFF (default)."""
-    image = np.zeros((1, 4, 4), dtype=np.uint8)
-    add_window_to_basic_classification_dataset(
-        basic_classification_dataset,
-        images={("image_layer1", 0): image},
-    )
-
-    # With index_mode=OFF (default), no index should be created
-    dataset = ModelDataset(
-        basic_classification_dataset,
-        split_config=SplitConfig(),
-        task=ClassificationTask("label", ["cls0", "cls1"], read_class_id=True),
-        workers=0,
-        inputs={
-            "image": DataInput("raster", ["image_layer1"], bands=["band"]),
-            "targets": DataInput("vector", ["vector_layer"]),
-        },
-        index_mode=IndexMode.OFF,
-    )
-    assert len(dataset) == 1
-
-    # Verify no index directory was created
-    index_dir = basic_classification_dataset.path / INDEX_DIR_NAME
-    assert not index_dir.exists()
-
-
-def test_skip_if_output_layer_exists(
-    basic_classification_dataset: Dataset,
-    add_window_to_basic_classification_dataset: Callable,
-) -> None:
-    """Test that windows with existing output layers are skipped when configured."""
-    # Create two windows with images
-    image = np.zeros((1, 4, 4), dtype=np.uint8)
-
-    # First window - will have the output layer already completed
-    window1 = add_window_to_basic_classification_dataset(
-        basic_classification_dataset,
-        images={
-            ("image_layer1", 0): image,
-        },
-        window_name="window_with_output",
-    )
-
-    # Second window - will NOT have the output layer
-    add_window_to_basic_classification_dataset(
-        basic_classification_dataset,
-        images={
-            ("image_layer1", 0): image,
-        },
-        window_name="window_without_output",
-    )
-
-    # Mark the first window as having the output layer completed
-    # Ensure the output layer directory exists before marking completed.
-    layer_dir = window1.get_layer_dir("predictions")
-    layer_dir.mkdir(parents=True, exist_ok=True)
-    window1.mark_layer_completed("predictions")
-
-    dataset = ModelDataset(
-        basic_classification_dataset,
-        split_config=SplitConfig(
-            output_layer_name_skip_inference_if_exists="predictions",
-        ),
-        task=ClassificationTask("label", ["cls0", "cls1"], read_class_id=True),
-        workers=1,
-        inputs={
-            "image": DataInput("raster", ["image_layer1"], bands=["band"]),
-            "targets": DataInput("vector", ["vector_layer"]),
-        },
-    )
-
-    assert len(dataset) == 1
-    windows = dataset.get_dataset_examples()
-    assert windows[0].name == "window_without_output"
-
-    # Test 3: Without setting output_layer_name_skip_inference_if_exists, should get both windows
-    dataset = ModelDataset(
-        basic_classification_dataset,
-        split_config=SplitConfig(),
-        task=ClassificationTask("label", ["cls0", "cls1"], read_class_id=True),
-        workers=1,
-        inputs={
-            "image": DataInput("raster", ["image_layer1"], bands=["band"]),
-            "targets": DataInput("vector", ["vector_layer"]),
-        },
-    )
-
-    assert len(dataset) == 2
-
-
-def test_non_required_layer_missing(
-    basic_classification_dataset: Dataset,
-    add_window_to_basic_classification_dataset: Callable,
-) -> None:
-    """Test that windows with missing non-required layers are still loaded.
-
-    When a DataInput has required=False, windows where that layer is missing
-    should still be included in the dataset, and reading from those windows
-    should skip the missing input without raising an error.
-    """
-    image = np.zeros((1, 4, 4), dtype=np.uint8)
-
-    # Window 1: has both image_layer1 and image_layer2
-    add_window_to_basic_classification_dataset(
-        basic_classification_dataset,
-        name="window_with_both",
-        images={
-            ("image_layer1", 0): image,
-            ("image_layer2", 0): image,
-        },
-    )
-
-    # Window 2: has only image_layer1 (image_layer2 is missing)
-    add_window_to_basic_classification_dataset(
-        basic_classification_dataset,
-        name="window_with_only_layer1",
-        images={
-            ("image_layer1", 0): image,
-            # image_layer2 is intentionally missing
-        },
-    )
-
-    # Create dataset with image_layer2 as non-required
-    dataset = ModelDataset(
-        basic_classification_dataset,
-        split_config=SplitConfig(),
-        task=ClassificationTask("label", ["cls0", "cls1"], read_class_id=True),
-        workers=1,
-        inputs={
-            "image1": DataInput(
-                "raster",
-                ["image_layer1"],
-                bands=["band"],
-                passthrough=True,
-                required=True,
-            ),
-            "image2": DataInput(
-                "raster",
-                ["image_layer2"],
-                bands=["band"],
-                passthrough=True,
-                required=False,  # This layer is optional
-            ),
-            "targets": DataInput("vector", ["vector_layer"]),
-        },
-    )
-
-    # Both windows should be included (non-required layer doesn't filter)
-    assert len(dataset) == 2
-
-    # Reading from both windows should work
-    for idx in range(2):
-        inputs, _, metadata = dataset[idx]
-        # image1 should always be present
-        assert "image1" in inputs
-
-        # image2 may or may not be present depending on the window
-        if metadata.window_name == "window_with_both":
-            assert "image2" in inputs
-        else:
-            # For window_with_only_layer1, image2 should be skipped
-            assert "image2" not in inputs
-
-
-class TestSplitConfig:
-    """Tests for SplitConfig."""
-
-    def test_overlap_ratio_with_patch_size_in_separate_configs(self) -> None:
-        """Test that overlap_ratio works when patch_size is set in a different config.
-
-        This test simulates the user setting patch_size in the default config, and
-        overlap_ratio in the predict config (which is merged via merge_and_validate).
-        """
-        default_config = SplitConfig(patch_size=128, load_all_crops=True)
-        predict_config = SplitConfig(overlap_ratio=0.5)
-
-        with warnings.catch_warnings():
-            warnings.simplefilter("ignore", FutureWarning)
-            merged = SplitConfig.merge_and_validate([default_config, predict_config])
-
-        # get_overlap_pixels should compute correctly: 128 * 0.5 = 64
-        assert merged.get_overlap_pixels() == 64
-
-    def test_overlap_ratio_without_crop_size_raises_on_get(self) -> None:
-        """Test that overlap_ratio without crop_size raises error in get_overlap_pixels."""
-        config = SplitConfig(overlap_ratio=0.5)
-
-        # Should raise when trying to get overlap_pixels
-        with pytest.raises(ValueError, match="overlap_ratio requires crop_size"):
-            config.get_overlap_pixels()
-
-    def test_crop_size_and_patch_size_in_separate_configs_raises(self) -> None:
-        """Test that setting crop_size and patch_size in different configs raises error."""
-        config1 = SplitConfig(crop_size=128)
-        config2 = SplitConfig(patch_size=256)
-
-        with pytest.raises(
-            ValueError, match="Cannot specify both crop_size and patch_size"
-        ):
-            with warnings.catch_warnings():
-                warnings.simplefilter("ignore", FutureWarning)
-                SplitConfig.merge_and_validate([config1, config2])
-
-    def test_negative_overlap_pixels_raises(self) -> None:
-        """Test that negative overlap_pixels raises error."""
-        config = SplitConfig(crop_size=128, load_all_crops=True, overlap_pixels=-1)
-
-        with pytest.raises(ValueError, match="overlap_pixels must be non-negative"):
-            SplitConfig.merge_and_validate([config])
-
-
-def test_compute_expected_timestamps_per_period_mosaic() -> None:
-    """Test compute_expected_timestamps for PER_PERIOD_MOSAIC mode.
-
-    Should compute expected timestamps based on window time_range, period_duration,
-    and max_matches from the query config.
-    """
-    # Create a mock window with a 4-month time range
-    mock_storage = MagicMock()
-    window = Window(
-        storage=mock_storage,
-        group="test",
-        name="test_window",
-        projection=WGS84_PROJECTION,
-        bounds=(0, 0, 100, 100),
-        time_range=(
-            datetime(2025, 1, 1),
-            datetime(2025, 5, 1),
-        ),  # Jan 1 - May 1 (4 months)
-    )
-
-    # Create layer config with PER_PERIOD_MOSAIC mode, 30-day periods, max 4 matches
-    layer_config = LayerConfig(
-        type=LayerType.RASTER,
-        band_sets=[BandSetConfig(dtype=DType.UINT8, bands=["band"])],
-        data_source=DataSourceConfig(
-            class_path="rslearn.data_sources.sentinel2.Sentinel2",
-            query_config=QueryConfig(
-                space_mode=SpaceMode.PER_PERIOD_MOSAIC,
-                period_duration=timedelta(days=30),
-                max_matches=4,
-            ),
-        ),
-    )
-
-    expected_ts = compute_expected_timestamps(window, layer_config)
-
-    assert expected_ts is not None
-    assert len(expected_ts) == 4  # 4 periods
-
-    # Timestamps should be in chronological order (oldest first)
-    for i in range(len(expected_ts) - 1):
-        assert expected_ts[i][0] < expected_ts[i + 1][0]
-    assert expected_ts[-1][1] == datetime(2025, 5, 1)
-
-    # Each period should be 30 days
-    for start, end in expected_ts:
-        assert (end - start).days == 30
-
-
-def test_compute_expected_timestamps_with_time_offset() -> None:
-    """Test compute_expected_timestamps applies time_offset correctly."""
-    mock_storage = MagicMock()
-    window = Window(
-        storage=mock_storage,
-        group="test",
-        name="test_window",
-        projection=WGS84_PROJECTION,
-        bounds=(0, 0, 100, 100),
-        time_range=(datetime(2025, 1, 1), datetime(2025, 4, 1)),
-    )
-
-    # Layer config with a 30-day time offset
-    layer_config = LayerConfig(
-        type=LayerType.RASTER,
-        band_sets=[BandSetConfig(dtype=DType.UINT8, bands=["band"])],
-        data_source=DataSourceConfig(
-            class_path="rslearn.data_sources.sentinel2.Sentinel2",
-            query_config=QueryConfig(
-                space_mode=SpaceMode.PER_PERIOD_MOSAIC,
-                period_duration=timedelta(days=30),
-                max_matches=3,
-            ),
-            time_offset=timedelta(days=30),  # Shift 30 days into future
-        ),
-    )
-
-    expected_ts = compute_expected_timestamps(window, layer_config)
-
-    assert expected_ts is not None
-    # First timestamp should be after Jan 1 + 30 days offset
-    assert expected_ts[0][0] >= datetime(2025, 1, 31)
-    assert expected_ts[0][0] <= datetime(2025, 2, 1)
-
-
-def test_compute_expected_timestamps_with_duration_override() -> None:
-    """Test compute_expected_timestamps applies duration override correctly."""
-    mock_storage = MagicMock()
-    window = Window(
-        storage=mock_storage,
-        group="test",
-        name="test_window",
-        projection=WGS84_PROJECTION,
-        bounds=(0, 0, 100, 100),
-        time_range=(datetime(2025, 1, 1), datetime(2025, 12, 31)),  # Full year
-    )
-
-    # Override duration to only 60 days from start
-    layer_config = LayerConfig(
-        type=LayerType.RASTER,
-        band_sets=[BandSetConfig(dtype=DType.UINT8, bands=["band"])],
-        data_source=DataSourceConfig(
-            class_path="rslearn.data_sources.sentinel2.Sentinel2",
-            query_config=QueryConfig(
-                space_mode=SpaceMode.PER_PERIOD_MOSAIC,
-                period_duration=timedelta(days=30),
-                max_matches=12,
-            ),
-            duration=timedelta(days=60),  # Only use 60 days
-        ),
-    )
-
-    expected_ts = compute_expected_timestamps(window, layer_config)
-
-    assert expected_ts is not None
-    # With 60-day duration and 30-day periods, should only get 2 periods
-    assert len(expected_ts) == 2
-
-
-def test_compute_expected_timestamps_no_time_range() -> None:
-    """Test compute_expected_timestamps returns None when window has no time_range."""
-    mock_storage = MagicMock()
-    window = Window(
-        storage=mock_storage,
-        group="test",
-        name="test_window",
-        projection=WGS84_PROJECTION,
-        bounds=(0, 0, 100, 100),
-        time_range=None,  # No time range
-    )
-
-    layer_config = LayerConfig(
-        type=LayerType.RASTER,
-        band_sets=[BandSetConfig(dtype=DType.UINT8, bands=["band"])],
-        data_source=DataSourceConfig(
-            class_path="rslearn.data_sources.sentinel2.Sentinel2",
-            query_config=QueryConfig(
-                space_mode=SpaceMode.PER_PERIOD_MOSAIC,
-                period_duration=timedelta(days=30),
-                max_matches=4,
-            ),
-        ),
-    )
-
-    expected_ts = compute_expected_timestamps(window, layer_config)
-    assert expected_ts is None
-
-
-def test_compute_expected_timestamps_no_data_source() -> None:
-    """Test compute_expected_timestamps returns None when layer has no data_source."""
-    mock_storage = MagicMock()
-    window = Window(
-        storage=mock_storage,
-        group="test",
-        name="test_window",
-        projection=WGS84_PROJECTION,
-        bounds=(0, 0, 100, 100),
-        time_range=(datetime(2025, 1, 1), datetime(2025, 4, 1)),
-    )
-
-    # Layer config without data_source
-    layer_config = LayerConfig(
-        type=LayerType.RASTER,
-        band_sets=[BandSetConfig(dtype=DType.UINT8, bands=["band"])],
-        data_source=None,
-    )
-
-    expected_ts = compute_expected_timestamps(window, layer_config)
-    assert expected_ts is None
-
-
-def test_compute_expected_timestamps_single_timestep() -> None:
-    """Test compute_expected_timestamps for single-timestep (max_matches=1) mode."""
-    mock_storage = MagicMock()
-    window = Window(
-        storage=mock_storage,
-        group="test",
-        name="test_window",
-        projection=WGS84_PROJECTION,
-        bounds=(0, 0, 100, 100),
-        time_range=(datetime(2025, 1, 1), datetime(2025, 2, 1)),
-    )
-
-    # MOSAIC mode with max_matches=1 (default)
-    layer_config = LayerConfig(
-        type=LayerType.RASTER,
-        band_sets=[BandSetConfig(dtype=DType.UINT8, bands=["band"])],
-        data_source=DataSourceConfig(
-            class_path="rslearn.data_sources.sentinel2.Sentinel2",
-            query_config=QueryConfig(
-                space_mode=SpaceMode.MOSAIC,
-                max_matches=1,
-            ),
-        ),
-    )
-
-    expected_ts = compute_expected_timestamps(window, layer_config)
-
-    assert expected_ts is not None
-    assert len(expected_ts) == 1
-    assert expected_ts[0] == (datetime(2025, 1, 1), datetime(2025, 2, 1))
-
-
-def test_compute_expected_timestamps_excess_periods_returns_none() -> None:
-    """Test compute_expected_timestamps returns None when total periods exceed max_matches.
-
-    When the window time range covers more periods than max_matches, the actual
-    periods selected depend on data availability (excess periods serve as fallback).
-    In this case, expected timestamps cannot be reliably predicted, so None is returned.
-    """
-    mock_storage = MagicMock()
-    # Window covers 4 months (120 days) with 30-day periods = 4 periods
-    window = Window(
-        storage=mock_storage,
-        group="test",
-        name="test_window",
-        projection=WGS84_PROJECTION,
-        bounds=(0, 0, 100, 100),
-        time_range=(datetime(2025, 1, 1), datetime(2025, 5, 1)),
-    )
-
-    # max_matches=2 but window has 4 periods -> excess periods as fallback
-    layer_config = LayerConfig(
-        type=LayerType.RASTER,
-        band_sets=[BandSetConfig(dtype=DType.UINT8, bands=["band"])],
-        data_source=DataSourceConfig(
-            class_path="rslearn.data_sources.sentinel2.Sentinel2",
-            query_config=QueryConfig(
-                space_mode=SpaceMode.PER_PERIOD_MOSAIC,
-                period_duration=timedelta(days=30),
-                max_matches=2,
-            ),
-        ),
-    )
-
-    expected_ts = compute_expected_timestamps(window, layer_config)
-    assert expected_ts is None
-
-
-def test_compute_expected_timestamps_exact_periods_returns_timestamps() -> None:
-    """Test compute_expected_timestamps returns timestamps when periods == max_matches.
-
-    When total periods exactly equals max_matches, there are no fallback periods,
-    so expected timestamps can be reliably computed.
-    """
-    mock_storage = MagicMock()
-    # Window covers exactly 2 periods (60 days with 30-day periods)
-    window = Window(
-        storage=mock_storage,
-        group="test",
-        name="test_window",
-        projection=WGS84_PROJECTION,
-        bounds=(0, 0, 100, 100),
-        time_range=(datetime(2025, 1, 1), datetime(2025, 3, 2)),
-    )
-
-    layer_config = LayerConfig(
-        type=LayerType.RASTER,
-        band_sets=[BandSetConfig(dtype=DType.UINT8, bands=["band"])],
-        data_source=DataSourceConfig(
-            class_path="rslearn.data_sources.sentinel2.Sentinel2",
-            query_config=QueryConfig(
-                space_mode=SpaceMode.PER_PERIOD_MOSAIC,
-                period_duration=timedelta(days=30),
-                max_matches=2,
-            ),
-        ),
-    )
-
-    expected_ts = compute_expected_timestamps(window, layer_config)
-    assert expected_ts is not None
-    assert len(expected_ts) == 2
-
-
-class TestCheckWindow:
-    """Tests for check_window and CheckWindowResult."""
-
-    def test_passes_when_all_inputs_available(
-        self,
-        basic_classification_dataset: Dataset,
-        add_window_to_basic_classification_dataset: Callable,
-    ) -> None:
-        """Window is returned with empty result when all required inputs are present."""
-        image = np.zeros((1, 4, 4), dtype=np.uint8)
-        window = add_window_to_basic_classification_dataset(
+    assert inputs["image"].shape == (2, 4, 4)
+    assert torch.all(inputs["image"][0] == 1)
+    assert torch.all(inputs["image"][1] == 2)
+
+
+class TestIterableAllPatchesDataset:
+    """Tests for IterableAllPatchesDataset."""
+
+    def test_one_window_per_worker(self, basic_classification_dataset: Dataset) -> None:
+        """Verify that things work with one window per worker."""
+        add_window(basic_classification_dataset, name="window0")
+        add_window(basic_classification_dataset, name="window1")
+        add_window(basic_classification_dataset, name="window2")
+        add_window(basic_classification_dataset, name="window3")
+        model_dataset = ModelDataset(
             basic_classification_dataset,
-            images={("image_layer1", 0): image},
+            split_config=SplitConfig(),
+            task=ClassificationTask("label", ["cls0", "cls1"], read_class_id=True),
+            workers=1,
+            inputs={
+                "targets": DataInput("vector", ["vector_layer"]),
+            },
         )
-        inputs = {
-            "image": DataInput("raster", ["image_layer1"], bands=["band"]),
-            "targets": DataInput("vector", ["vector_layer"]),
-        }
-        result_window, result = check_window(inputs, window)
-        assert result_window is window
-        assert result.missing_data_input_counts == {}
-        assert result.has_output_layer_count == 0
+        world_size = 4
+        window_names = set()
+        for rank in range(world_size):
+            all_patches_dataset = IterableAllPatchesDataset(
+                model_dataset, (4, 4), rank=rank, world_size=world_size
+            )
+            samples = list(all_patches_dataset)
+            assert len(samples) == 1
+            window_names.add(samples[0][2]["window_name"])
+        assert len(window_names) == 4
 
-    def test_skipped_for_missing_required_input(
-        self,
-        basic_classification_dataset: Dataset,
-        add_window_to_basic_classification_dataset: Callable,
+    def test_different_window_sizes(
+        self, basic_classification_dataset: Dataset
     ) -> None:
-        """Window is skipped and result reports the missing input key."""
-        image = np.zeros((1, 4, 4), dtype=np.uint8)
-        window = add_window_to_basic_classification_dataset(
+        """Verify that rank padding works with different window sizes."""
+        # One rank should get the second window.
+        # While the other rank should get first window and needs to repeat it.
+        add_window(basic_classification_dataset, name="window0", bounds=(0, 0, 4, 4))
+        add_window(basic_classification_dataset, name="window1", bounds=(0, 0, 8, 8))
+        model_dataset = ModelDataset(
             basic_classification_dataset,
-            images={("image_layer1", 0): image},
+            split_config=SplitConfig(),
+            task=ClassificationTask("label", ["cls0", "cls1"], read_class_id=True),
+            workers=1,
+            inputs={
+                "targets": DataInput("vector", ["vector_layer"]),
+            },
         )
-        inputs = {
-            "image": DataInput("raster", ["image_layer1"], bands=["band"]),
-            "missing_layer": DataInput(
-                "raster", ["nonexistent_layer"], bands=["band"], required=True
-            ),
-        }
-        result_window, result = check_window(inputs, window)
-        assert result_window is None
-        assert result.missing_data_input_counts == {"missing_layer": 1}
-        assert result.has_output_layer_count == 0
+        world_size = 2
+        seen_patches: dict[tuple[str, PixelBounds], int] = {}
+        for rank in range(world_size):
+            all_patches_dataset = IterableAllPatchesDataset(
+                model_dataset, (4, 4), rank=rank, world_size=world_size
+            )
+            samples = list(all_patches_dataset)
+            assert len(samples) == 4
+            for sample in samples:
+                patch_id = (sample[2]["window_name"], sample[2]["bounds"])
+                seen_patches[patch_id] = seen_patches.get(patch_id, 0) + 1
 
-    def test_skipped_for_existing_output_layer(
-        self,
-        basic_classification_dataset: Dataset,
-        add_window_to_basic_classification_dataset: Callable,
-    ) -> None:
-        """Window is skipped and result reports existing output layer."""
-        image = np.zeros((1, 4, 4), dtype=np.uint8)
-        window = add_window_to_basic_classification_dataset(
+        assert len(seen_patches) == 5
+        assert seen_patches[("window0", (0, 0, 4, 4))] == 4
+        assert seen_patches[("window1", (0, 0, 4, 4))] == 1
+        assert seen_patches[("window1", (0, 4, 4, 8))] == 1
+        assert seen_patches[("window1", (4, 0, 8, 4))] == 1
+        assert seen_patches[("window1", (4, 4, 8, 8))] == 1
+
+    def test_empty_dataset(self, basic_classification_dataset: Dataset) -> None:
+        """Verify that IterableAllPatchesDataset works with no windows."""
+        model_dataset = ModelDataset(
             basic_classification_dataset,
-            images={("image_layer1", 0): image},
+            split_config=SplitConfig(),
+            task=ClassificationTask("label", ["cls0", "cls1"], read_class_id=True),
+            workers=1,
+            inputs={
+                "targets": DataInput("vector", ["vector_layer"]),
+            },
         )
-        # Mark an output layer as completed.
-        layer_dir = window.get_layer_dir("predictions")
-        layer_dir.mkdir(parents=True, exist_ok=True)
-        window.mark_layer_completed("predictions")
+        world_size = 2
+        for rank in range(world_size):
+            all_patches_dataset = IterableAllPatchesDataset(
+                model_dataset, (4, 4), rank=rank, world_size=world_size
+            )
+            samples = list(all_patches_dataset)
+            assert len(samples) == 0
 
-        inputs = {
-            "image": DataInput("raster", ["image_layer1"], bands=["band"]),
-            "targets": DataInput("vector", ["vector_layer"]),
-        }
-        result_window, result = check_window(
-            inputs,
-            window,
-            output_layer_name_skip_inference_if_exists="predictions",
+
+class TestInMemoryAllPatchesDataset:
+    """Tests for InMemoryAllPatchesDataset."""
+
+    def test_iterable_equal(self, basic_classification_dataset: Dataset) -> None:
+        """Verify that InMemoryAllPatchesDataset and IterableAllPatchesDataset are equivalent."""
+        # Create a couple of windows with different sizes to exercise patching.
+        add_window(basic_classification_dataset, name="w0", bounds=(0, 0, 4, 4))
+        add_window(basic_classification_dataset, name="w1", bounds=(0, 0, 8, 8))
+
+        # Build a minimal ModelDataset (only targets needed for this comparison).
+        model_dataset = ModelDataset(
+            basic_classification_dataset,
+            split_config=SplitConfig(),
+            task=ClassificationTask("label", ["cls0", "cls1"], read_class_id=True),
+            workers=1,
+            inputs={
+                "targets": DataInput("vector", ["vector_layer"]),
+            },
         )
-        assert result_window is None
-        assert result.missing_data_input_counts == {}
-        assert result.has_output_layer_count == 1
+
+        # Construct iterable and regular versions.
+        patch_size = (3, 3)
+        iterable_ds = IterableAllPatchesDataset(
+            model_dataset, patch_size, rank=0, world_size=1
+        )
+        regular_ds = InMemoryAllPatchesDataset(model_dataset, patch_size)
+
+        iterable_samples = list(iterable_ds)
+        regular_samples = [regular_ds[i] for i in range(len(regular_ds))]
+
+        # Compare metadata (last element of each tuple) index-by-index.
+        assert len(iterable_samples) == len(regular_samples)
+        for i in range(len(iterable_samples)):
+            assert iterable_samples[i][-1] == regular_samples[i][-1]

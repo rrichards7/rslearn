@@ -89,7 +89,7 @@ Here is a summary of the configuration options:
             image_selectors: ["image"]
             # Selectors for DetectionTask targets that should be flipped. Note that the
             # DetectionTask targets are a dict with keys for boxes, labels, etc., but
-            # the selectors here should correspond to the overall dict. The example
+            # the selectors here should correspond to the overall dict. There example
             # here would work for single-task training; if using MultiTask, then if the
             # detection task name is "detect", you can set box_selectors to
             # ["target/detect"] (not ["target/detect/boxes"]).
@@ -171,27 +171,6 @@ Then, the dataset should contain a `mask` layer with a raster that is 0 at pixel
 were outside the context used for labeling, and 1 otherwise, and a `sentinel2` layer
 containing the input image. The image will be masked to 0 at regions not considered
 during labeling, so that the model can learn to predict no boxes in those regions.
-
-## Sentinel2SCLToMask
-
-The `Sentinel2SCLToMask` transform converts a Sentinel-2 Scene Classification Layer
-(SCL) raster into a binary mask image (1 = valid, 0 = masked). This can be used with
-`Mask` to apply SCL-based masking at training time.
-
-```yaml
-      transforms:
-        - class_path: rslearn.train.transforms.sentinel2.Sentinel2SCLToMask
-          init_args:
-            scl_selector: "scl"
-            output_selector: "mask"
-            # Default: [3, 8, 9, 10] (cloud shadow, medium/high cloud, cirrus)
-            exclude_scl_values: [3, 8, 9, 10]
-        - class_path: rslearn.train.transforms.mask.Mask
-          init_args:
-            selectors: ["image"]
-            mask_selector: "mask"
-            mask_value: 0
-```
 
 ## Normalize
 

@@ -1,11 +1,8 @@
 """Normalization transforms."""
 
-import warnings
 from typing import Any
 
 import torch
-
-from rslearn.train.model_context import RasterImage
 
 from .transform import Transform
 
@@ -23,7 +20,6 @@ class Normalize(Transform):
         selectors: list[str] = ["image"],
         bands: list[int] | None = None,
         num_bands: int | None = None,
-        skip_missing: bool = False,
     ) -> None:
         """Initialize a new Normalize.
 
@@ -37,19 +33,14 @@ class Normalize(Transform):
             bands: optionally restrict the normalization to these band indices. If set,
                 mean and std must either be one value, or have length equal to the
                 number of band indices passed here.
-            num_bands: deprecated, no longer used. Will be removed after 2026-04-01.
-            skip_missing: if True, skip selectors that don't exist in the input/target
-                dicts. Useful when working with optional inputs.
+            num_bands: the number of bands per image, to distinguish different images
+                in a time series. If set, then the bands list is repeated for each
+                image, e.g. if bands=[2] then we apply normalization on images[2],
+                images[2+num_bands], images[2+num_bands*2], etc. Or if the bands list
+                is not set, then we apply the mean and std on each image in the time
+                series.
         """
-        super().__init__(skip_missing=skip_missing)
-
-        if num_bands is not None:
-            warnings.warn(
-                "num_bands is deprecated and no longer used. "
-                "It will be removed after 2026-04-01.",
-                FutureWarning,
-            )
-
+        super().__init__()
         self.mean = torch.tensor(mean)
         self.std = torch.tensor(std)
 
@@ -62,37 +53,63 @@ class Normalize(Transform):
 
         self.selectors = selectors
         self.bands = torch.tensor(bands) if bands is not None else None
+        self.num_bands = num_bands
 
-    def apply_image(self, image: RasterImage) -> RasterImage:
+    def apply_image(self, image: torch.Tensor) -> torch.Tensor:
         """Normalize the specified image.
 
         Args:
             image: the image to transform.
         """
-        # Get mean/std with singleton dims for broadcasting over CTHW.
-        if len(self.mean.shape) == 0:
-            # Scalar - broadcasts naturally.
-            mean, std = self.mean, self.std
-        else:
-            # Vector of length C - add singleton dims for T, H, W.
-            mean = self.mean[:, None, None, None]
-            std = self.std[:, None, None, None]
+
+        def _repeat_mean_and_std(
+            image_channels: int, num_bands: int | None
+        ) -> tuple[torch.Tensor, torch.Tensor]:
+            """Get mean and std tensor that are suitable for applying on the image."""
+            # We only need to repeat the tensor if both of these are true:
+            # - The mean/std are not just one scalar.
+            # - self.num_bands is set, otherwise we treat the input as a single image.
+            if len(self.mean.shape) == 0:
+                return self.mean, self.std
+            if num_bands is None:
+                return self.mean, self.std
+            num_images = image_channels // num_bands
+            return self.mean.repeat(num_images)[:, None, None], self.std.repeat(
+                num_images
+            )[:, None, None]
 
         if self.bands is not None:
-            # Normalize only specific band indices.
-            image.image[self.bands] = (image.image[self.bands] - mean) / std
+            # User has provided band indices to normalize.
+            # If num_bands is set, then we repeat these for each image in the input
+            # image time series.
+            band_indices = self.bands
+            if self.num_bands:
+                num_images = image.shape[0] // self.num_bands
+                band_indices = torch.cat(
+                    [
+                        band_indices + image_idx * self.num_bands
+                        for image_idx in range(num_images)
+                    ],
+                    dim=0,
+                )
+
+            # We use len(self.bands) here because that is how many bands per timestep
+            # we are actually processing with the mean/std.
+            mean, std = _repeat_mean_and_std(
+                image_channels=len(band_indices), num_bands=len(self.bands)
+            )
+            image[band_indices] = (image[band_indices] - mean) / std
             if self.valid_min is not None:
-                image.image[self.bands] = torch.clamp(
-                    image.image[self.bands],
-                    min=self.valid_min,
-                    max=self.valid_max,
+                image[band_indices] = torch.clamp(
+                    image[band_indices], min=self.valid_min, max=self.valid_max
                 )
         else:
-            image.image = (image.image - mean) / std
+            mean, std = _repeat_mean_and_std(
+                image_channels=image.shape[0], num_bands=self.num_bands
+            )
+            image = (image - mean) / std
             if self.valid_min is not None:
-                image.image = torch.clamp(
-                    image.image, min=self.valid_min, max=self.valid_max
-                )
+                image = torch.clamp(image, min=self.valid_min, max=self.valid_max)
         return image
 
     def forward(

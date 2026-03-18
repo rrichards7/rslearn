@@ -50,6 +50,19 @@ class VectorFormat:
         """
         raise NotImplementedError
 
+    @staticmethod
+    def from_config(name: str, config: dict[str, Any]) -> "VectorFormat":
+        """Create a VectorFormat from a config dict.
+
+        Args:
+            name: the name of this format
+            config: the config dict
+
+        Returns:
+            the VectorFormat instance
+        """
+        raise NotImplementedError
+
 
 class TileVectorFormat(VectorFormat):
     """TileVectorFormat stores data in GeoJSON files corresponding to grid cells.
@@ -205,6 +218,26 @@ class TileVectorFormat(VectorFormat):
                     features.append(feat.to_projection(projection))
         return features
 
+    @staticmethod
+    def from_config(name: str, config: dict[str, Any]) -> "TileVectorFormat":
+        """Create a TileVectorFormat from a config dict.
+
+        Args:
+            name: the name of this format
+            config: the config dict
+
+        Returns:
+            the TileVectorFormat
+        """
+        kwargs = {}
+        if "tile_size" in config:
+            kwargs["tile_size"] = config["tile_size"]
+        if "projection" in config:
+            kwargs["projection"] = Projection.deserialize(config["projection"])
+        if "index_property_name" in config:
+            kwargs["index_property_name"] = config["index_property_name"]
+        return TileVectorFormat(**kwargs)
+
 
 class GeojsonCoordinateMode(Enum):
     """The projection to use when writing GeoJSON file."""
@@ -357,3 +390,19 @@ class GeojsonVectorFormat(VectorFormat):
             reprojected_features.append(Feature(geom, feat.properties))
 
         return reprojected_features
+
+    @staticmethod
+    def from_config(name: str, config: dict[str, Any]) -> "GeojsonVectorFormat":
+        """Create a GeojsonVectorFormat from a config dict.
+
+        Args:
+            name: the name of this format
+            config: the config dict
+
+        Returns:
+            the GeojsonVectorFormat
+        """
+        kwargs = {}
+        if "coordinate_mode" in config:
+            kwargs["coordinate_mode"] = GeojsonCoordinateMode(config["coordinate_mode"])
+        return GeojsonVectorFormat(**kwargs)

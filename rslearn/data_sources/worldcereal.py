@@ -291,7 +291,7 @@ class WorldCereal(LocalFiles):
             raise ValueError(f"No AEZ files found for {self.band}")
 
         super().__init__(
-            src_dir=tif_dir.absolute().as_uri(),
+            src_dir=tif_dir,
             raster_item_specs=item_specs,
             layer_type=LayerType.RASTER,
             context=context,

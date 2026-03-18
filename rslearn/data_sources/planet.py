@@ -21,7 +21,53 @@ from rslearn.data_sources.utils import match_candidate_items_to_window
 from rslearn.tile_stores import TileStoreWithLayer
 from rslearn.utils import STGeometry
 from rslearn.utils.fsspec import join_upath
+from rslearn.dataset import Window
 
+from rslearn.config import LayerConfig, QueryConfig
+from rslearn.const import WGS84_PROJECTION
+from rslearn.data_sources import DataSource, DataSourceContext, Item
+from rslearn.data_sources.utils import match_candidate_items_to_window
+from rslearn.dataset import Window
+from rslearn.dataset.materialize import RasterMaterializer
+from rslearn.log_utils import get_logger
+from rslearn.tile_stores import TileStore, TileStoreWithLayer
+from rslearn.utils.fsspec import join_upath
+from rslearn.utils.geometry import PixelBounds, Projection, STGeometry
+from rslearn.utils.raster_format import get_raster_projection_and_bounds
+
+
+from rslearn.data_sources.direct_materialize_data_source import DirectMaterializeDataSource
+from rslearn.data_sources import Item, DataSourceContext
+from rslearn.utils.geometry import STGeometry
+from rasterio.warp import transform_bounds, reproject, Resampling
+import numpy as np
+import rasterio
+import asyncio
+import tempfile
+from pathlib import Path
+
+from rslearn.data_sources.direct_materialize_data_source import DirectMaterializeDataSource
+from rslearn.utils.geometry import STGeometry
+import rasterio
+
+
+from rslearn.data_sources.direct_materialize_data_source import DirectMaterializeDataSource
+from rslearn.data_sources import DataSourceContext
+from rslearn.utils.geometry import STGeometry
+from rslearn.utils.raster_format import get_raster_projection_and_bounds
+from rslearn.tile_stores import TileStoreWithLayer
+from rslearn.log_utils import get_logger
+
+import rasterio
+import asyncio
+import tempfile
+from pathlib import Path
+from datetime import datetime
+from typing import Any
+import numpy as np
+from rasterio.warp import transform_bounds, Resampling, reproject
+
+logger = get_logger(__name__)
 
 class Planet(DataSource):
     """A data source for Planet Labs API.
@@ -33,7 +79,7 @@ class Planet(DataSource):
         self,
         item_type_id: str,
         cache_dir: str | None = None,
-        asset_type_id: str = "ortho_analytic_sr",
+        asset_type_id: str = "ortho_analytic_4b_sr", # ortho_analytic_8b_sr for superdove
         range_filters: dict[str, dict[str, Any]] = {},
         use_permission_filter: bool = True,
         sort_by: str | None = None,
@@ -68,6 +114,9 @@ class Planet(DataSource):
         self.sort_by = sort_by
         self.bands = bands
 
+        self.asset_bands = {"default": self.bands}
+        DirectMaterializeDataSource.__init__(self, asset_bands=self.asset_bands)
+
         if cache_dir is None:
             self.cache_dir = None
         else:
@@ -76,6 +125,10 @@ class Planet(DataSource):
             else:
                 self.cache_dir = UPath(cache_dir)
 
+    def get_raster_bands(self, layer_name: str, item_name: str) -> list[list[str]]:
+        """Return the band sets available for this PlanetScope item."""
+        return list(self.asset_bands.values())
+        
     async def _search_items(self, geometry: STGeometry) -> list[dict[str, Any]]:
         wgs84_geometry = geometry.to_projection(WGS84_PROJECTION)
         geojson_data = json.loads(shapely.to_geojson(wgs84_geometry.shp))
@@ -173,8 +226,9 @@ class Planet(DataSource):
         planet_item = asyncio.run(self._get_item_by_name(name))
         return self._wrap_planet_item(planet_item)
 
-    def deserialize_item(self, serialized_item: dict) -> Item:
+    def deserialize_item(self, serialized_item: Any) -> Item:
         """Deserializes an item from JSON-decoded data."""
+        assert isinstance(serialized_item, dict)
         return Item.deserialize(serialized_item)
 
     async def _download_asset(self, item: Item, tmp_dir: pathlib.Path) -> UPath:
@@ -195,7 +249,7 @@ class Planet(DataSource):
             await client.activate_asset(asset)
             # Wait up to two hours for asset to be ready.
             await client.wait_asset(asset, max_attempts=1600, delay=5)
-
+            
             # Need to refresh the asset so it has location attribute.
             asset = await client.get_asset(
                 self.item_type_id, item.name, self.asset_type_id
@@ -233,14 +287,9 @@ class Planet(DataSource):
             geometries: a list of geometries needed for each item
         """
         for item in items:
-            if tile_store.is_raster_ready(item, self.bands):
+            if tile_store.is_raster_ready(item.name, self.bands):
                 continue
 
             with tempfile.TemporaryDirectory() as tmp_dir:
                 asset_path = asyncio.run(self._download_asset(item, Path(tmp_dir)))
-                tile_store.write_raster_file(
-                    item,
-                    self.bands,
-                    asset_path,
-                    time_range=item.geometry.time_range,
-                )
+                tile_store.write_raster_file(item.name, self.bands, asset_path)

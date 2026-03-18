@@ -12,11 +12,9 @@ from einops import rearrange
 from upath import UPath
 
 from rslearn.log_utils import get_logger
-from rslearn.train.model_context import ModelContext
 from rslearn.train.transforms.transform import Transform
 from rslearn.utils.fsspec import open_atomic
 
-from .component import FeatureExtractor, FeatureMaps
 from .use_croma import PretrainedCROMA
 
 logger = get_logger(__name__)
@@ -78,7 +76,7 @@ MODALITY_BANDS = {
 }
 
 
-class Croma(FeatureExtractor):
+class Croma(torch.nn.Module):
     """CROMA backbones.
 
     There are two model sizes, base and large.
@@ -162,29 +160,20 @@ class Croma(FeatureExtractor):
             align_corners=False,
         )
 
-    def forward(self, context: ModelContext) -> FeatureMaps:
+    def forward(self, inputs: list[dict[str, Any]]) -> list[torch.Tensor]:
         """Compute feature maps from the Croma backbone.
 
-        Args:
-            context: the model context. Input dicts must include either/both of
-                "sentinel2" or "sentinel1" keys depending on the configured modality.
-
-        Returns:
-            a FeatureMaps with one feature map at 1/8 the input resolution.
+        Inputs:
+            inputs: input dicts that must include either/both of "sentinel2" or
+                "sentinel1" keys depending on the configured modality.
         """
         sentinel1: torch.Tensor | None = None
         sentinel2: torch.Tensor | None = None
         if self.modality in [CromaModality.BOTH, CromaModality.SENTINEL1]:
-            sentinel1 = torch.stack(
-                [inp["sentinel1"].single_ts_to_chw_tensor() for inp in context.inputs],
-                dim=0,
-            )
+            sentinel1 = torch.stack([inp["sentinel1"] for inp in inputs], dim=0)
             sentinel1 = self._resize_image(sentinel1) if self.do_resizing else sentinel1
         if self.modality in [CromaModality.BOTH, CromaModality.SENTINEL2]:
-            sentinel2 = torch.stack(
-                [inp["sentinel2"].single_ts_to_chw_tensor() for inp in context.inputs],
-                dim=0,
-            )
+            sentinel2 = torch.stack([inp["sentinel2"] for inp in inputs], dim=0)
             sentinel2 = self._resize_image(sentinel2) if self.do_resizing else sentinel2
 
         outputs = self.model(
@@ -211,7 +200,7 @@ class Croma(FeatureExtractor):
             w=num_patches_per_dim,
         )
 
-        return FeatureMaps([features])
+        return [features]
 
     def get_backbone_channels(self) -> list:
         """Returns the output channels of this model when used as a backbone.
@@ -300,7 +289,5 @@ class CromaNormalize(Transform):
         for modality in MODALITY_BANDS.keys():
             if modality not in input_dict:
                 continue
-            input_dict[modality].image = self.apply_image(
-                input_dict[modality].image, modality
-            )
+            input_dict[modality] = self.apply_image(input_dict[modality], modality)
         return input_dict, target_dict

@@ -4,12 +4,8 @@ from typing import Any
 
 import torch
 
-from rslearn.train.model_context import ModelContext
 
-from .component import FeatureMaps, IntermediateComponent
-
-
-class Conv(IntermediateComponent):
+class Conv(torch.nn.Module):
     """A single convolutional layer.
 
     It inputs a set of feature maps; the conv layer is applied to each feature map
@@ -42,22 +38,19 @@ class Conv(IntermediateComponent):
         )
         self.activation = activation
 
-    def forward(self, intermediates: Any, context: ModelContext) -> FeatureMaps:
-        """Apply conv layer on each feature map.
+    def forward(self, features: list[torch.Tensor], inputs: Any) -> list[torch.Tensor]:
+        """Compute flat output vector from multi-scale feature map.
 
         Args:
-            intermediates: the previous output, which must be a FeatureMaps.
-            context: the model context.
+            features: list of feature maps at different resolutions.
+            inputs: original inputs (ignored).
 
         Returns:
-            the resulting feature maps after applying the same Conv2d on each one.
+            flat feature vector
         """
-        if not isinstance(intermediates, FeatureMaps):
-            raise ValueError("input to Conv must be FeatureMaps")
-
         new_features = []
-        for feat_map in intermediates.feature_maps:
+        for feat_map in features:
             feat_map = self.layer(feat_map)
             feat_map = self.activation(feat_map)
             new_features.append(feat_map)
-        return FeatureMaps(new_features)
+        return new_features

@@ -6,10 +6,6 @@ from typing import Any
 import torch
 import torchvision
 
-from rslearn.train.model_context import ModelContext, ModelOutput
-
-from .component import FeatureMaps, Predictor
-
 
 class NoopTransform(torch.nn.Module):
     """A placeholder transform used with torchvision detection model."""
@@ -59,7 +55,7 @@ class NoopTransform(torch.nn.Module):
         return image_list, targets
 
 
-class FasterRCNN(Predictor):
+class FasterRCNN(torch.nn.Module):
     """Faster R-CNN head for predicting bounding boxes.
 
     It inputs multi-scale features, using each feature map to predict ROIs and then
@@ -180,23 +176,20 @@ class FasterRCNN(Predictor):
 
     def forward(
         self,
-        intermediates: Any,
-        context: ModelContext,
+        features: list[torch.Tensor],
+        inputs: list[dict[str, Any]],
         targets: list[dict[str, Any]] | None = None,
-    ) -> ModelOutput:
+    ) -> tuple[dict[str, torch.Tensor], dict[str, torch.Tensor]]:
         """Compute the detection outputs and loss from features.
 
         Args:
-            intermediates: the output from the previous component, which must be a FeatureMaps.
-            context: the model context. Input dicts must contain image key for original image size.
+            features: multi-scale feature maps.
+            inputs: original inputs, should cotnain image key for original image size.
             targets: should contain class key that stores the class label.
 
         Returns:
             tuple of outputs and loss dict
         """
-        if not isinstance(intermediates, FeatureMaps):
-            raise ValueError("input to FasterRCNN must be FeatureMaps")
-
         # Fix target labels to be 1 size in case it's empty.
         # For some reason this is needed.
         if targets:
@@ -210,12 +203,11 @@ class FasterRCNN(Predictor):
                     ),
                 )
 
-        # take the first (and assumed to be only) timestep
-        image_list = [inp["image"].image[:, 0] for inp in context.inputs]
+        image_list = [inp["image"] for inp in inputs]
         images, targets = self.noop_transform(image_list, targets)
 
         feature_dict = collections.OrderedDict()
-        for i, feat_map in enumerate(intermediates.feature_maps):
+        for i, feat_map in enumerate(features):
             feature_dict[f"feat{i}"] = feat_map
 
         proposals, proposal_losses = self.rpn(images, feature_dict, targets)
@@ -227,7 +219,4 @@ class FasterRCNN(Predictor):
         losses.update(proposal_losses)
         losses.update(detector_losses)
 
-        return ModelOutput(
-            outputs=detections,
-            loss_dict=losses,
-        )
+        return detections, losses

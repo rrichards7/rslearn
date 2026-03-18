@@ -15,7 +15,6 @@ from rslearn.train.data_module import RslearnDataModule
 from rslearn.train.dataset import DataInput
 from rslearn.train.tasks.classification import ClassificationHead, ClassificationTask
 from rslearn.utils import Feature, STGeometry
-from rslearn.utils.raster_array import RasterArray
 from rslearn.utils.raster_format import SingleImageRasterFormat
 from rslearn.utils.vector_format import GeojsonVectorFormat
 
@@ -51,10 +50,10 @@ def image_to_class_dataset(tmp_path: pathlib.Path) -> Dataset:
     ds_path.mkdir(parents=True, exist_ok=True)
     with (ds_path / "config.json").open("w") as f:
         json.dump(dataset_config, f)
-    dataset = Dataset(ds_path)
 
+    window_path = Window.get_window_root(ds_path, "default", "default")
     window = Window(
-        storage=dataset.storage,
+        path=window_path,
         group="default",
         name="default",
         projection=WGS84_PROJECTION,
@@ -72,7 +71,7 @@ def image_to_class_dataset(tmp_path: pathlib.Path) -> Dataset:
         layer_dir / "band",
         window.projection,
         window.bounds,
-        RasterArray(chw_array=image),
+        image,
     )
     window.mark_layer_completed(layer_name)
 
@@ -91,7 +90,7 @@ def image_to_class_dataset(tmp_path: pathlib.Path) -> Dataset:
     )
     window.mark_layer_completed(layer_name)
 
-    return dataset
+    return Dataset(ds_path)
 
 
 @pytest.fixture

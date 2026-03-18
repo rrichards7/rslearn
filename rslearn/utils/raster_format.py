@@ -2,14 +2,11 @@
 
 import hashlib
 import json
-from datetime import datetime
 from typing import Any, BinaryIO
 
 import affine
-import einops
 import numpy as np
 import numpy.typing as npt
-import pydantic
 import rasterio
 from PIL import Image
 from rasterio.crs import CRS
@@ -18,15 +15,11 @@ from upath import UPath
 
 from rslearn.const import TILE_SIZE
 from rslearn.log_utils import get_logger
-from rslearn.utils.array import copy_spatial_array
 from rslearn.utils.fsspec import open_rasterio_upath_reader, open_rasterio_upath_writer
-from rslearn.utils.raster_array import RasterArray
 
 from .geometry import PixelBounds, Projection
 
 logger = get_logger(__name__)
-
-METADATA_FNAME = "metadata.json"
 
 
 def get_bandset_dirname(bands: list[str]) -> str:
@@ -149,7 +142,7 @@ class RasterFormat:
     """An abstract class for writing raster data.
 
     Implementations of RasterFormat should support reading and writing raster data in
-    a UPath. Raster data is represented as a RasterArray (C, T, H, W).
+    a UPath. Raster data is a CxHxW numpy array.
     """
 
     def encode_raster(
@@ -157,7 +150,7 @@ class RasterFormat:
         path: UPath,
         projection: Projection,
         bounds: PixelBounds,
-        raster: RasterArray,
+        array: npt.NDArray[Any],
     ) -> None:
         """Encodes raster data.
 
@@ -165,7 +158,7 @@ class RasterFormat:
             path: the directory to write to
             projection: the projection of the raster data
             bounds: the bounds of the raster data in the projection
-            raster: the raster data
+            array: the raster data
         """
         raise NotImplementedError
 
@@ -175,7 +168,7 @@ class RasterFormat:
         projection: Projection,
         bounds: PixelBounds,
         resampling: Resampling = Resampling.bilinear,
-    ) -> RasterArray:
+    ) -> npt.NDArray[Any]:
         """Decodes raster data.
 
         Args:
@@ -189,14 +182,18 @@ class RasterFormat:
         """
         raise NotImplementedError
 
+    @staticmethod
+    def from_config(name: str, config: dict[str, Any]) -> "RasterFormat":
+        """Create a RasterFormat from a config dict.
 
-class ImageTileRasterMetadata(pydantic.BaseModel):
-    """Metadata sidecar for ImageTileRasterFormat."""
+        Args:
+            name: the name of this format
+            config: the config dict
 
-    projection: dict[str, Any]
-    dtype: str
-    num_bands: int
-    timestamps: list[tuple[datetime, datetime]] | None = None
+        Returns:
+            the RasterFormat instance
+        """
+        raise NotImplementedError
 
 
 class ImageTileRasterFormat(RasterFormat):
@@ -282,7 +279,7 @@ class ImageTileRasterFormat(RasterFormat):
         path: UPath,
         projection: Projection,
         bounds: PixelBounds,
-        raster: RasterArray,
+        array: npt.NDArray[Any],
     ) -> None:
         """Encodes raster data.
 
@@ -290,18 +287,20 @@ class ImageTileRasterFormat(RasterFormat):
             path: the directory to write to
             projection: the projection of the raster data
             bounds: the bounds of the raster data in the projection
-            raster: the raster data (CTHW RasterArray, T must be 1)
+            array: the raster data (must be CHW)
         """
-        array = raster.get_chw_array()
-
-        metadata = ImageTileRasterMetadata(
-            projection=projection.serialize(),
-            dtype=array.dtype.name,
-            num_bands=array.shape[0],
-            timestamps=raster.timestamps,
-        )
-        with (path / METADATA_FNAME).open("w") as f:
-            f.write(metadata.model_dump_json())
+        # Write metadata about the projection that we are writing under.
+        # We also save dtype and number of bands so we can return correct shape when
+        # there are no intersecting tiles.
+        with (path / "metadata.json").open("w") as f:
+            json.dump(
+                {
+                    "projection": projection.serialize(),
+                    "dtype": array.dtype.name,
+                    "num_bands": array.shape[0],
+                },
+                f,
+            )
 
         start_tile = (bounds[0] // self.tile_size, bounds[1] // self.tile_size)
         end_tile = (bounds[2] // self.tile_size + 1, bounds[3] // self.tile_size + 1)
@@ -346,7 +345,7 @@ class ImageTileRasterFormat(RasterFormat):
         projection: Projection,
         bounds: PixelBounds,
         resampling: Resampling = Resampling.bilinear,
-    ) -> RasterArray:
+    ) -> npt.NDArray[Any]:
         """Decodes raster data.
 
         Args:
@@ -360,9 +359,9 @@ class ImageTileRasterFormat(RasterFormat):
         """
         # Verify that the source data has the same projection as the requested one.
         # ImageTileRasterFormat currently does not support re-projecting.
-        with (path / METADATA_FNAME).open() as f:
-            image_metadata = ImageTileRasterMetadata.model_validate_json(f.read())
-        source_data_projection = Projection.deserialize(image_metadata.projection)
+        with (path / "metadata.json").open() as f:
+            image_metadata = json.load(f)
+        source_data_projection = Projection.deserialize(image_metadata["projection"])
         if source_data_projection != projection:
             raise NotImplementedError(
                 "not implemented to re-project source data "
@@ -378,11 +377,11 @@ class ImageTileRasterFormat(RasterFormat):
             (bounds[3] - 1) // self.tile_size + 1,
         )
         dst_shape = (
-            image_metadata.num_bands,
+            image_metadata["num_bands"],
             bounds[3] - bounds[1],
             bounds[2] - bounds[0],
         )
-        dst = np.zeros(dst_shape, dtype=image_metadata.dtype)
+        dst = np.zeros(dst_shape, dtype=image_metadata["dtype"])
         for col in range(start_tile[0], end_tile[0]):
             for row in range(start_tile[1], end_tile[1]):
                 fname = path / f"{col}_{row}.{extension}"
@@ -400,18 +399,26 @@ class ImageTileRasterFormat(RasterFormat):
                 cur_col_off = col * self.tile_size
                 cur_row_off = row * self.tile_size
 
-                copy_spatial_array(
-                    src,
-                    dst,
-                    src_offset=(cur_col_off, cur_row_off),
-                    dst_offset=(bounds[0], bounds[1]),
+                src_col_offset = max(bounds[0] - cur_col_off, 0)
+                src_row_offset = max(bounds[1] - cur_row_off, 0)
+                dst_col_offset = max(cur_col_off - bounds[0], 0)
+                dst_row_offset = max(cur_row_off - bounds[1], 0)
+                col_overlap = min(
+                    src.shape[2] - src_col_offset, dst.shape[2] - dst_col_offset
                 )
-
-        # Wrap as CTHW with T=1.
-        return RasterArray(
-            array=dst[:, np.newaxis, :, :],
-            timestamps=image_metadata.timestamps,
-        )
+                row_overlap = min(
+                    src.shape[1] - src_row_offset, dst.shape[1] - dst_row_offset
+                )
+                dst[
+                    :,
+                    dst_row_offset : dst_row_offset + row_overlap,
+                    dst_col_offset : dst_col_offset + col_overlap,
+                ] = src[
+                    :,
+                    src_row_offset : src_row_offset + row_overlap,
+                    src_col_offset : src_col_offset + col_overlap,
+                ]
+        return dst
 
     def get_extension(self) -> str:
         """Returns the extension to use based on the configured image format."""
@@ -423,37 +430,24 @@ class ImageTileRasterFormat(RasterFormat):
             return "tif"
         raise ValueError(f"unknown image format {self.format}")
 
+    @staticmethod
+    def from_config(name: str, config: dict[str, Any]) -> "ImageTileRasterFormat":
+        """Create a ImageTileRasterFormat from a config dict.
 
-class GeotiffRasterMetadata(pydantic.BaseModel):
-    """Metadata sidecar for GeotiffRasterFormat.
-
-    All fields are optional for backward compatibility with legacy metadata files.
-    """
-
-    num_channels: int | None = None
-    num_timesteps: int | None = None
-    timestamps: list[tuple[datetime, datetime]] | None = None
+        Args:
+            name: the name of this format
+            config: the config dict
+        """
+        return ImageTileRasterFormat(
+            format=config.get("format", "geotiff"),
+            tile_size=config.get("tile_size", 512),
+        )
 
 
 class GeotiffRasterFormat(RasterFormat):
     """A raster format that uses one big, tiled GeoTIFF with small block size."""
 
     fname = "geotiff.tif"
-
-    @staticmethod
-    def encode_metadata(path: UPath, metadata: GeotiffRasterMetadata) -> None:
-        """Write a GeotiffRasterMetadata sidecar to *path* / metadata.json."""
-        with (path / METADATA_FNAME).open("w") as f:
-            f.write(metadata.model_dump_json())
-
-    @staticmethod
-    def decode_metadata(path: UPath) -> GeotiffRasterMetadata | None:
-        """Read the GeotiffRasterMetadata sidecar, or return None if absent."""
-        metadata_path = path / METADATA_FNAME
-        if not metadata_path.exists():
-            return None
-        with metadata_path.open() as f:
-            return GeotiffRasterMetadata.model_validate_json(f.read())
 
     def __init__(
         self,
@@ -480,33 +474,20 @@ class GeotiffRasterFormat(RasterFormat):
         path: UPath,
         projection: Projection,
         bounds: PixelBounds,
-        raster: RasterArray,
+        array: npt.NDArray[Any],
         fname: str | None = None,
-        nodata_val: int | float | None = None,
     ) -> None:
         """Encodes raster data.
-
-        Supports multi-timestep data (T > 1) by flattening (C, T, H, W) to
-        (C*T, H, W) in the GeoTIFF and writing a metadata.json sidecar with
-        ``num_channels``, ``num_timesteps``, and ``timestamps``.
-
-        For T == 1, a metadata.json is only written when timestamps are present.
 
         Args:
             path: the directory to write to
             projection: the projection of the raster data
             bounds: the bounds of the raster data in the projection
-            raster: the raster data (CTHW RasterArray)
+            array: the raster data
             fname: override the filename to save as
-            nodata_val: set the nodata value when writing the raster.
         """
         if fname is None:
             fname = self.fname
-
-        c, t, h, w = raster.array.shape
-
-        # Flatten CTHW -> (C*T, H, W) for the GeoTIFF.
-        array = raster.array.reshape(c * t, h, w)
 
         crs = projection.crs
         transform = affine.Affine(
@@ -539,9 +520,6 @@ class GeotiffRasterFormat(RasterFormat):
             profile["tiled"] = True
             profile["blockxsize"] = self.block_size
             profile["blockysize"] = self.block_size
-        # Set nodata_val if provided.
-        if nodata_val is not None:
-            profile["nodata"] = nodata_val
 
         profile.update(self.geotiff_options)
 
@@ -550,17 +528,6 @@ class GeotiffRasterFormat(RasterFormat):
         with open_rasterio_upath_writer(path / fname, **profile) as dst:
             dst.write(array)
 
-        # Write metadata.json sidecar when multi-timestep or timestamps are present.
-        if t > 1 or raster.timestamps is not None:
-            self.encode_metadata(
-                path,
-                GeotiffRasterMetadata(
-                    num_channels=c,
-                    num_timesteps=t,
-                    timestamps=raster.timestamps,
-                ),
-            )
-
     def decode_raster(
         self,
         path: UPath,
@@ -568,12 +535,8 @@ class GeotiffRasterFormat(RasterFormat):
         bounds: PixelBounds,
         resampling: Resampling = Resampling.bilinear,
         fname: str | None = None,
-        nodata_val: int | float | None = None,
-    ) -> RasterArray:
+    ) -> npt.NDArray[Any]:
         """Decodes raster data.
-
-        If a metadata.json sidecar exists with ``num_timesteps > 1``, the GeoTIFF
-        is treated as (C*T, H, W) and reshaped back to (C, T, H, W).
 
         Args:
             path: the directory to read from
@@ -581,54 +544,25 @@ class GeotiffRasterFormat(RasterFormat):
             bounds: the bounds to read in the given projection.
             resampling: resampling method to use in case resampling is needed.
             fname: override the filename to read from
-            nodata_val: override the nodata value in the raster when reading. Pixels in
-                bounds that are not present in the source raster will be initialized to
-                this value. Note that, if the raster specifies a nodata value, and
-                some source pixels have that value, they will still be read under their
-                original value; overriding the nodata value is primarily useful if the
-                user wants out of bounds pixels to have a different value from the
-                source pixels, e.g. if the source data has background and foreground
-                classes (with background being nodata) but we want to read it in a
-                different projection and have out of bounds pixels be a third "invalid"
-                value.
 
         Returns:
-            the raster data as a RasterArray (CTHW)
+            the raster data
         """
         if fname is None:
             fname = self.fname
 
-        metadata = self.decode_metadata(path)
-
         # Construct the transform to use for the warped dataset.
         wanted_transform = get_transform_from_projection_and_bounds(projection, bounds)
         with open_rasterio_upath_reader(path / fname) as src:
-            vrt_kwargs: dict = dict(
+            with rasterio.vrt.WarpedVRT(
+                src,
                 crs=projection.crs,
                 transform=wanted_transform,
                 width=bounds[2] - bounds[0],
                 height=bounds[3] - bounds[1],
                 resampling=resampling,
-            )
-            # Only pass src_nodata if nodata_val is None, since src_nodata=None is
-            # treated as setting it to 0 (overriding the actual src nodata value) in
-            # rasterio.
-            if nodata_val is not None:
-                vrt_kwargs["src_nodata"] = nodata_val
-            with rasterio.vrt.WarpedVRT(src, **vrt_kwargs) as vrt:
-                raw = vrt.read()  # (bands, H, W)
-
-        # Reshape from (C*T, H, W) -> (C, T, H, W).
-        if metadata and metadata.num_timesteps is not None:
-            num_timesteps = metadata.num_timesteps
-            num_channels = metadata.num_channels or raw.shape[0]
-        else:
-            num_timesteps = 1
-            num_channels = raw.shape[0]
-        array = raw.reshape(num_channels, num_timesteps, raw.shape[1], raw.shape[2])
-
-        timestamps = metadata.timestamps if metadata else None
-        return RasterArray(array=array, timestamps=timestamps)
+            ) as vrt:
+                return vrt.read()
 
     def get_raster_bounds(self, path: UPath) -> PixelBounds:
         """Returns the bounds of the stored raster.
@@ -643,13 +577,25 @@ class GeotiffRasterFormat(RasterFormat):
             _, bounds = get_raster_projection_and_bounds(src)
             return bounds
 
+    @staticmethod
+    def from_config(name: str, config: dict[str, Any]) -> "GeotiffRasterFormat":
+        """Create a GeotiffRasterFormat from a config dict.
 
-class SingleImageRasterMetadata(pydantic.BaseModel):
-    """Metadata sidecar for SingleImageRasterFormat."""
+        Args:
+            name: the name of this format
+            config: the config dict
 
-    projection: dict[str, Any] | None = None
-    bounds: PixelBounds
-    timestamps: list[tuple[datetime, datetime]] | None = None
+        Returns:
+            the GeotiffRasterFormat
+        """
+        kwargs = {}
+        if "block_size" in config:
+            kwargs["block_size"] = config["block_size"]
+        if "always_enable_tiling" in config:
+            kwargs["always_enable_tiling"] = config["always_enable_tiling"]
+        if "geotiff_options" in config:
+            kwargs["geotiff_options"] = config["geotiff_options"]
+        return GeotiffRasterFormat(**kwargs)
 
 
 class SingleImageRasterFormat(RasterFormat):
@@ -684,7 +630,7 @@ class SingleImageRasterFormat(RasterFormat):
         path: UPath,
         projection: Projection,
         bounds: PixelBounds,
-        raster: RasterArray,
+        array: npt.NDArray[Any],
     ) -> None:
         """Encodes raster data.
 
@@ -692,26 +638,26 @@ class SingleImageRasterFormat(RasterFormat):
             path: the directory to write to
             projection: the projection of the raster data
             bounds: the bounds of the raster data in the projection
-            raster: the raster data (CTHW RasterArray, T must be 1)
+            array: the raster data
         """
-        array = raster.get_chw_array()
-
         path.mkdir(parents=True, exist_ok=True)
         fname = path / ("image." + self.get_extension())
         with fname.open("wb") as f:
-            # CHW -> HWC for PIL and squeeze channel dim for grayscale images.
-            img_array = einops.rearrange(array, "c h w -> h w c")
-            if img_array.shape[2] == 1:
-                img_array = img_array[:, :, 0]
-            Image.fromarray(img_array).save(f, format=self.format.upper())
+            array = array.transpose(1, 2, 0)
+            if array.shape[2] == 1:
+                array = array[:, :, 0]
+            Image.fromarray(array).save(f, format=self.format.upper())
 
-        metadata = SingleImageRasterMetadata(
-            projection=projection.serialize(),
-            bounds=bounds,
-            timestamps=raster.timestamps,
-        )
-        with (path / METADATA_FNAME).open("w") as f:
-            f.write(metadata.model_dump_json())
+        # Since the image file doesn't include the georeferencing, we store it in an
+        # auxiliary metadata file.
+        with (path / "metadata.json").open("w") as f:
+            json.dump(
+                {
+                    "projection": projection.serialize(),
+                    "bounds": bounds,
+                },
+                f,
+            )
 
     def decode_raster(
         self,
@@ -719,7 +665,7 @@ class SingleImageRasterFormat(RasterFormat):
         projection: Projection,
         bounds: PixelBounds,
         resampling: Resampling = Resampling.bilinear,
-    ) -> RasterArray:
+    ) -> npt.NDArray[Any]:
         """Decodes raster data.
 
         Args:
@@ -733,13 +679,18 @@ class SingleImageRasterFormat(RasterFormat):
         """
         # Try to get the bounds of the saved image from the metadata file.
         # In old versions, the file may be missing the projection key.
-        with (path / METADATA_FNAME).open() as f:
-            image_metadata = SingleImageRasterMetadata.model_validate_json(f.read())
+        metadata_fname = path / "metadata.json"
+        with metadata_fname.open() as f:
+            image_metadata = json.load(f)
+
+        image_bounds = image_metadata["bounds"]
 
         # If the projection key is set, verify that it matches the requested projection
         # since SingleImageRasterFormat currently does not support re-projecting.
-        if image_metadata.projection is not None:
-            source_data_projection = Projection.deserialize(image_metadata.projection)
+        if "projection" in image_metadata:
+            source_data_projection = Projection.deserialize(
+                image_metadata["projection"]
+            )
             if projection != source_data_projection:
                 raise NotImplementedError(
                     "not implemented to re-project source data "
@@ -754,22 +705,47 @@ class SingleImageRasterFormat(RasterFormat):
             array = array[:, :, None]
         array = array.transpose(2, 0, 1)
 
-        if bounds != image_metadata.bounds:
-            # Need to extract relevant portion of image.
-            dst = np.zeros(
-                (array.shape[0], bounds[3] - bounds[1], bounds[2] - bounds[0]),
-                dtype=array.dtype,
-            )
-            copy_spatial_array(
-                array,
-                dst,
-                src_offset=(image_metadata.bounds[0], image_metadata.bounds[1]),
-                dst_offset=(bounds[0], bounds[1]),
-            )
-            array = dst
+        if bounds == image_bounds:
+            return array
 
-        # Wrap as CTHW with T=1.
-        return RasterArray(
-            array=array[:, np.newaxis, :, :],
-            timestamps=image_metadata.timestamps,
+        # Need to extract relevant portion of image.
+        dst = np.zeros(
+            (array.shape[0], bounds[3] - bounds[1], bounds[2] - bounds[0]),
+            dtype=array.dtype,
         )
+        src_col_offset = max(bounds[0] - image_bounds[0], 0)
+        src_row_offset = max(bounds[1] - image_bounds[1], 0)
+        dst_col_offset = max(image_bounds[0] - bounds[0], 0)
+        dst_row_offset = max(image_bounds[1] - bounds[1], 0)
+        col_overlap = min(
+            array.shape[2] - src_col_offset, dst.shape[2] - dst_col_offset
+        )
+        row_overlap = min(
+            array.shape[1] - src_row_offset, dst.shape[1] - dst_row_offset
+        )
+        dst[
+            :,
+            dst_row_offset : dst_row_offset + row_overlap,
+            dst_col_offset : dst_col_offset + col_overlap,
+        ] = array[
+            :,
+            src_row_offset : src_row_offset + row_overlap,
+            src_col_offset : src_col_offset + col_overlap,
+        ]
+        return dst
+
+    @staticmethod
+    def from_config(name: str, config: dict[str, Any]) -> "SingleImageRasterFormat":
+        """Create a SingleImageRasterFormat from a config dict.
+
+        Args:
+            name: the name of this format
+            config: the config dict
+
+        Returns:
+            the SingleImageRasterFormat
+        """
+        kwargs = {}
+        if "format" in config:
+            kwargs["format"] = config["format"]
+        return SingleImageRasterFormat(**kwargs)

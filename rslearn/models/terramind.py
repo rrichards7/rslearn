@@ -8,10 +8,7 @@ import torch.nn.functional as F
 from einops import rearrange
 from terratorch.registry import BACKBONE_REGISTRY
 
-from rslearn.train.model_context import ModelContext
 from rslearn.train.transforms.transform import Transform
-
-from .component import FeatureExtractor, FeatureMaps
 
 
 # TerraMind v1 provides two sizes: base and large
@@ -88,7 +85,7 @@ PRETRAINED_BANDS = {
 }
 
 
-class Terramind(FeatureExtractor):
+class Terramind(torch.nn.Module):
     """Terramind backbones."""
 
     def __init__(
@@ -126,26 +123,21 @@ class Terramind(FeatureExtractor):
         self.modalities = modalities
         self.do_resizing = do_resizing
 
-    def forward(self, context: ModelContext) -> FeatureMaps:
+    def forward(self, inputs: list[dict[str, Any]]) -> list[torch.Tensor]:
         """Forward pass for the Terramind model.
 
         Args:
-            context: the model context. Input dicts must include modalities as keys
-                which are defined in the self.modalities list.
+            inputs: input dicts that must include modalities as keys which are defined in the self.modalities list
 
         Returns:
-            a FeatureMaps with one feature map from the encoder, at 1/16 of the input
-                resolution.
+            List[torch.Tensor]: Single-scale feature tensors from the encoder.
         """
         model_inputs = {}
         for modality in self.modalities:
             # We assume the all the inputs include the same modalities
-            if modality not in context.inputs[0]:
+            if modality not in inputs[0]:
                 continue
-            cur = torch.stack(
-                [inp[modality].single_ts_to_chw_tensor() for inp in context.inputs],
-                dim=0,
-            )  # (B, C, H, W)
+            cur = torch.stack([inp[modality] for inp in inputs], dim=0)  # (B, C, H, W)
             if self.do_resizing and (
                 cur.shape[2] != IMAGE_SIZE or cur.shape[3] != IMAGE_SIZE
             ):
@@ -167,17 +159,7 @@ class Terramind(FeatureExtractor):
         image_features = self.model(model_inputs)[-1]
         batch_size, num_patches, _ = image_features.shape
         height, width = int(num_patches**0.5), int(num_patches**0.5)
-        return FeatureMaps(
-            [
-                rearrange(
-                    image_features,
-                    "b (h w) d -> b d h w",
-                    b=batch_size,
-                    h=height,
-                    w=width,
-                )
-            ]
-        )
+        return [rearrange(image_features, "b (h w) d -> b d h w", h=height, w=width)]
 
     def get_backbone_channels(self) -> list:
         """Returns the output channels of this model when used as a backbone.
@@ -220,7 +202,7 @@ class TerramindNormalize(Transform):
         Returns:
             The normalized image.
         """
-        images = image.float()  # (C, 1, H, W)
+        images = image.float()  # (C, H, W)
         if images.shape[0] % len(means) != 0:
             raise ValueError(
                 f"the number of image channels {images.shape[0]} is not multiple of expected number of bands {len(means)}"
@@ -248,8 +230,8 @@ class TerramindNormalize(Transform):
             band_info = PRETRAINED_BANDS[modality]
             means = [band_info[band][0] for band in band_info]
             stds = [band_info[band][1] for band in band_info]
-            input_dict[modality].image = self.apply_image(
-                input_dict[modality].image,
+            input_dict[modality] = self.apply_image(
+                input_dict[modality],
                 means,
                 stds,
             )

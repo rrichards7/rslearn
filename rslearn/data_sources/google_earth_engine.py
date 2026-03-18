@@ -29,7 +29,6 @@ from rslearn.tile_stores import TileStore, TileStoreWithLayer
 from rslearn.utils.array import copy_spatial_array
 from rslearn.utils.fsspec import join_upath
 from rslearn.utils.geometry import PixelBounds, Projection, STGeometry
-from rslearn.utils.raster_array import RasterArray
 from rslearn.utils.raster_format import (
     Resampling,
     get_raster_projection_and_bounds_from_transform,
@@ -236,8 +235,9 @@ class GEE(DataSource, TileStore):
 
         return groups
 
-    def deserialize_item(self, serialized_item: dict) -> Item:
+    def deserialize_item(self, serialized_item: Any) -> Item:
         """Deserializes an item from JSON-decoded data."""
+        assert isinstance(serialized_item, dict)
         return Item.deserialize(serialized_item)
 
     def item_to_image(self, item: Item) -> ee.image.Image:
@@ -388,7 +388,7 @@ class GEE(DataSource, TileStore):
             geometries: a list of geometries needed for each item
         """
         for item in items:
-            if tile_store.is_raster_ready(item, self.bands):
+            if tile_store.is_raster_ready(item.name, self.bands):
                 continue
 
             # Export the item to GCS.
@@ -407,34 +407,26 @@ class GEE(DataSource, TileStore):
                     )
                     blobs[0].download_to_filename(local_fname)
                     tile_store.write_raster_file(
-                        item,
-                        self.bands,
-                        UPath(local_fname),
-                        time_range=item.geometry.time_range,
+                        item.name, self.bands, UPath(local_fname)
                     )
 
                 else:
                     array, projection, bounds = self._merge_rasters(blobs)
                     tile_store.write_raster(
-                        item,
-                        self.bands,
-                        projection,
-                        bounds,
-                        RasterArray(
-                            chw_array=array,
-                            time_range=item.geometry.time_range,
-                        ),
+                        item.name, self.bands, projection, bounds, array
                     )
 
             for blob in blobs:
                 blob.delete()
 
-    def is_raster_ready(self, layer_name: str, item: Item, bands: list[str]) -> bool:
+    def is_raster_ready(
+        self, layer_name: str, item_name: str, bands: list[str]
+    ) -> bool:
         """Checks if this raster has been written to the store.
 
         Args:
             layer_name: the layer name or alias.
-            item: the item.
+            item_name: the item.
             bands: the list of bands identifying which specific raster to read.
 
         Returns:
@@ -444,12 +436,12 @@ class GEE(DataSource, TileStore):
         # Always ready since we wrap accesses to Planetary Computer.
         return True
 
-    def get_raster_bands(self, layer_name: str, item: Item) -> list[list[str]]:
+    def get_raster_bands(self, layer_name: str, item_name: str) -> list[list[str]]:
         """Get the sets of bands that have been stored for the specified item.
 
         Args:
             layer_name: the layer name or alias.
-            item: the item.
+            item_name: the item.
 
         Returns:
             a list of lists of bands that are in the tile store (with one raster
@@ -459,13 +451,13 @@ class GEE(DataSource, TileStore):
         return [self.bands]
 
     def get_raster_bounds(
-        self, layer_name: str, item: Item, bands: list[str], projection: Projection
+        self, layer_name: str, item_name: str, bands: list[str], projection: Projection
     ) -> PixelBounds:
         """Get the bounds of the raster in the specified projection.
 
         Args:
             layer_name: the layer name or alias.
-            item: the item to check.
+            item_name: the item to check.
             bands: the list of bands identifying which specific raster to read. These
                 bands must match the bands of a stored raster.
             projection: the projection to get the raster's bounds in.
@@ -473,6 +465,7 @@ class GEE(DataSource, TileStore):
         Returns:
             the bounds of the raster in the projection.
         """
+        item = self.get_item_by_name(item_name)
         geom = item.geometry.to_projection(projection)
         return (
             int(geom.shp.bounds[0]),
@@ -484,17 +477,17 @@ class GEE(DataSource, TileStore):
     def read_raster(
         self,
         layer_name: str,
-        item: Item,
+        item_name: str,
         bands: list[str],
         projection: Projection,
         bounds: PixelBounds,
         resampling: Resampling = Resampling.bilinear,
-    ) -> RasterArray:
+    ) -> npt.NDArray[Any]:
         """Read raster data from the store.
 
         Args:
             layer_name: the layer name or alias.
-            item: the item to read.
+            item_name: the item to read.
             bands: the list of bands identifying which specific raster to read. These
                 bands must match the bands of a stored raster.
             projection: the projection to read in.
@@ -506,6 +499,7 @@ class GEE(DataSource, TileStore):
         """
         # Extract the requested extent and export to GCS.
         bounds_str = f"{bounds[0]}_{bounds[1]}_{bounds[2]}_{bounds[3]}"
+        item = self.get_item_by_name(item_name)
         blob_prefix = f"{self.collection_name}/{item.name}.{bounds_str}.{os.getpid()}/"
 
         try:
@@ -517,12 +511,9 @@ class GEE(DataSource, TileStore):
             logger.info(
                 f"No valid pixels in item {item.name} with projection={projection}, bounds={bounds}, returning empty image"
             )
-            return RasterArray(
-                chw_array=np.zeros(
-                    (len(bands), bounds[3] - bounds[1], bounds[2] - bounds[0]),
-                    dtype=np.float32,
-                ),
-                time_range=item.geometry.time_range,
+            return np.zeros(
+                (len(bands), bounds[3] - bounds[1], bounds[2] - bounds[0]),
+                dtype=np.float32,
             )
 
         wanted_transform = get_transform_from_projection_and_bounds(projection, bounds)
@@ -549,9 +540,7 @@ class GEE(DataSource, TileStore):
                     height=bounds[3] - bounds[1],
                     resampling=resampling,
                 ) as vrt:
-                    return RasterArray(
-                        chw_array=vrt.read(), time_range=item.geometry.time_range
-                    )
+                    return vrt.read()
 
         else:
             # With multiple outputs, we need to merge them together.
@@ -566,15 +555,13 @@ class GEE(DataSource, TileStore):
 
             # We copy the array if its bounds don't match exactly.
             if src_bounds == bounds:
-                return RasterArray(
-                    chw_array=src_array, time_range=item.geometry.time_range
-                )
+                return src_array
             dst_array = np.zeros(
                 (src_array.shape[0], bounds[3] - bounds[1], bounds[2] - bounds[0]),
                 dtype=src_array.dtype,
             )
             copy_spatial_array(src_array, dst_array, src_bounds[0:2], bounds[0:2])
-            return RasterArray(chw_array=dst_array, time_range=item.geometry.time_range)
+            return dst_array
 
     def materialize(
         self,

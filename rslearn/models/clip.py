@@ -1,13 +1,12 @@
 """OpenAI CLIP models."""
 
+from typing import Any
+
+import torch
 from transformers import AutoModelForZeroShotImageClassification, AutoProcessor
 
-from rslearn.train.model_context import ModelContext
 
-from .component import FeatureExtractor, FeatureMaps
-
-
-class CLIP(FeatureExtractor):
+class CLIP(torch.nn.Module):
     """CLIP image encoder."""
 
     def __init__(
@@ -32,23 +31,20 @@ class CLIP(FeatureExtractor):
         self.height = crop_size["height"] // stride[0]
         self.width = crop_size["width"] // stride[1]
 
-    def forward(self, context: ModelContext) -> FeatureMaps:
+    def forward(self, inputs: list[dict[str, Any]]) -> list[torch.Tensor]:
         """Compute outputs from the backbone.
 
-        Args:
-            context: the model context. Input dicts must include "image" key containing
-                the image to process. The images should have values 0-255.
+        Inputs:
+            inputs: input dicts that must include "image" key containing the image to
+                process. The images should have values 0-255.
 
         Returns:
-            a FeatureMaps with one feature map from the ViT, which is always Bx24x24x1024.
+            list of feature maps. The ViT produces features at one scale, so the list
+                contains a single Bx24x24x1024 feature map.
         """
-        inputs = context.inputs
-        device = inputs[0]["image"].image.device
+        device = inputs[0]["image"].device
         clip_inputs = self.processor(
-            images=[
-                inp["image"].single_ts_to_chw_tensor().cpu().numpy().transpose(1, 2, 0)
-                for inp in inputs
-            ],
+            images=[inp["image"].cpu().numpy().transpose(1, 2, 0) for inp in inputs],
             return_tensors="pt",
             padding=True,
         )
@@ -59,10 +55,8 @@ class CLIP(FeatureExtractor):
         batch_size = image_features.shape[0]
 
         # 576x1024 -> HxWxC
-        return FeatureMaps(
-            [
-                image_features.reshape(
-                    batch_size, self.height, self.width, self.num_features
-                ).permute(0, 3, 1, 2)
-            ]
-        )
+        return [
+            image_features.reshape(
+                batch_size, self.height, self.width, self.num_features
+            ).permute(0, 3, 1, 2)
+        ]

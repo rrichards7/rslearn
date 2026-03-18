@@ -10,7 +10,6 @@ from .dataset import (
     LayerType,
     QueryConfig,
     SpaceMode,
-    StorageConfig,
     TimeMode,
 )
 
@@ -24,6 +23,5 @@ __all__ = [
     "LayerType",
     "QueryConfig",
     "SpaceMode",
-    "StorageConfig",
     "TimeMode",
 ]

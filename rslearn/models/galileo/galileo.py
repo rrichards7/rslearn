@@ -3,18 +3,17 @@
 import math
 import tempfile
 from contextlib import nullcontext
-from datetime import datetime
 from enum import StrEnum
-from typing import cast
+from typing import Any, cast
 
 import numpy as np
 import torch
+import torch.nn as nn
 from einops import rearrange, repeat
 from huggingface_hub import hf_hub_download
 from upath import UPath
 
 from rslearn.log_utils import get_logger
-from rslearn.models.component import FeatureExtractor, FeatureMaps
 from rslearn.models.galileo.single_file_galileo import (
     CONFIG_FILENAME,
     DW_BANDS,
@@ -40,7 +39,6 @@ from rslearn.models.galileo.single_file_galileo import (
     MaskedOutput,
     Normalizer,
 )
-from rslearn.train.model_context import ModelContext
 
 logger = get_logger(__name__)
 
@@ -72,7 +70,7 @@ AUTOCAST_DTYPE_MAP = {
 }
 
 
-class GalileoModel(FeatureExtractor):
+class GalileoModel(nn.Module):
     """Galileo backbones."""
 
     input_keys = [
@@ -412,40 +410,23 @@ class GalileoModel(FeatureExtractor):
             months=months,
         )
 
-    @staticmethod
-    def time_ranges_to_timestamps(
-        time_ranges: list[tuple[datetime, datetime]],
-        device: torch.device,
-    ) -> torch.Tensor:
-        """Turn the time ranges stored in a RasterImage to timestamps accepted by Galileo.
-
-        Galileo only uses the month associated with each timestamp, so we take the midpoint
-        the time range. For some inputs (e.g. Sentinel 2) we take an image from a specific
-        time so that start_time == end_time == mid_time.
-        """
-        mid_ranges = [t[0] + ((t[1] - t[0]) / 2) for t in time_ranges]
-        # months are indexed 0-11
-        return torch.tensor(
-            [d.month - 1 for d in mid_ranges], dtype=torch.int32, device=device
-        )
-
-    def forward(self, context: ModelContext) -> FeatureMaps:
+    def forward(self, inputs: list[dict[str, Any]]) -> list[torch.Tensor]:
         """Compute feature maps from the Galileo backbone.
 
-        Args:
-            context: the model context. Input dicts should contain keys corresponding to Galileo.input_keys
+        Inputs:
+            inputs: a dictionary of tensors, where the keys are one of Galileo.input_keys
                 (also documented below) and values are tensors of the following shapes,
                 per input key:
-                    "s1": B C T H W
-                    "s2": B C T H W
-                    "era5": B C T H W  (we will average over the H, W dimensions)
-                    "tc": B C T H W  (we will average over the H, W dimensions)
-                    "viirs": B C T H W  (we will average over the H, W dimensions)
-                    "srtm": B C 1 H W (SRTM has no temporal dimension)
-                    "dw": : B C 1 H W (Dynamic World should be averaged over time)
-                    "wc": B C 1 H W (WorldCereal has no temporal dimension)
-                    "landscan":  B C 1 H W  (we will average over the H, W dimensions)
-                    "latlon":  B C 1 H W  (we will average over the H, W dimensions)
+                    "s1": B (T * C) H W
+                    "s2": B (T * C) H W
+                    "era5": B (T * C) H W  (we will average over the H, W dimensions)
+                    "tc": B (T * C) H W  (we will average over the H, W dimensions)
+                    "viirs": B (T * C) H W  (we will average over the H, W dimensions)
+                    "srtm": B C H W (SRTM has no temporal dimension)
+                    "dw": : B C H W (Dynamic World should be averaged over time)
+                    "wc": B C H W (WorldCereal has no temporal dimension)
+                    "landscan":  B C H W  (we will average over the H, W dimensions)
+                    "latlon":  B C H W  (we will average over the H, W dimensions)
 
         The output will be an embedding representing the pooled tokens. If there is
         only a single token per h/w dimension (i.e. patch_size == h,w), then we will take
@@ -454,35 +435,13 @@ class GalileoModel(FeatureExtractor):
         If there are many spatial tokens per h/w dimension (patch_size > h,w), then we will
         take a pool of the space_time unmasked tokens (i.e. of the s1 and s2 tokens).
         """
-        space_time_modalities = ["s1", "s2"]
-        time_modalities = ["era5", "tc", "viirs"]
         stacked_inputs = {}
-        months: torch.Tensor | None = None
-        for key in context.inputs[0].keys():
+        for key in inputs[0].keys():
             # assume all the keys in an input are consistent
             if key in self.input_keys:
-                stacked_inputs[key] = torch.stack(
-                    [inp[key].image for inp in context.inputs], dim=0
-                )
-                if key in space_time_modalities + time_modalities:
-                    if months is None:
-                        if context.inputs[0][key].timestamps is not None:
-                            months = torch.stack(
-                                [
-                                    self.time_ranges_to_timestamps(
-                                        inp[key].timestamps,  # type: ignore
-                                        device=stacked_inputs[key].device,
-                                    )
-                                    for inp in context.inputs
-                                ],
-                                dim=0,
-                            )
-
-        if months is not None:
-            stacked_inputs["months"] = months
-
+                stacked_inputs[key] = torch.stack([inp[key] for inp in inputs], dim=0)
         s_t_channels = []
-        for space_time_modality in space_time_modalities:
+        for space_time_modality in ["s1", "s2"]:
             if space_time_modality not in stacked_inputs:
                 continue
             if space_time_modality == "s1":
@@ -490,27 +449,36 @@ class GalileoModel(FeatureExtractor):
             else:
                 s_t_channels += self.s_t_channels_s2
             cur = stacked_inputs[space_time_modality]
-            cur = rearrange(cur, "b c t h w -> b h w t c")
+            # Check if it's single or multitemporal, and reshape accordingly
+            num_bands = len(S2_BANDS) if space_time_modality == "s2" else len(S1_BANDS)
+            num_timesteps = cur.shape[1] // num_bands
+            cur = rearrange(cur, "b (t c) h w -> b h w t c", t=num_timesteps)
             stacked_inputs[space_time_modality] = cur
 
         for space_modality in ["srtm", "dw", "wc"]:
             if space_modality not in stacked_inputs:
                 continue
-            # take the first (and assumed only) timestep
-            stacked_inputs[space_modality] = stacked_inputs[space_modality][:, :, 0]
             stacked_inputs[space_modality] = rearrange(
                 stacked_inputs[space_modality], "b c h w -> b h w c"
             )
 
-        for time_modality in time_modalities:
+        for time_modality in ["era5", "tc", "viirs"]:
             if time_modality not in stacked_inputs:
                 continue
             cur = stacked_inputs[time_modality]
+            # Check if it's single or multitemporal, and reshape accordingly
+            num_bands = {
+                "era5": len(ERA5_BANDS),
+                "tc": len(TC_BANDS),
+                "viirs": len(VIIRS_BANDS),
+            }[time_modality]
+            num_timesteps = cur.shape[1] // num_bands
             # take the average over the h, w bands since Galileo
             # treats it as a pixel-timeseries
             cur = rearrange(
-                torch.nanmean(cur, dim=(-1, -2)),
-                "b c t -> b t c",
+                torch.nanmean(torch.nanmean(cur, dim=-1), dim=-1),
+                "b (t c) -> b t c",
+                t=num_timesteps,
             )
             stacked_inputs[time_modality] = cur
 
@@ -518,8 +486,9 @@ class GalileoModel(FeatureExtractor):
             if static_modality not in stacked_inputs:
                 continue
             cur = stacked_inputs[static_modality]
-            stacked_inputs[static_modality] = torch.nanmean(cur, dim=(2, 3, 4))
-
+            stacked_inputs[static_modality] = torch.nanmean(
+                torch.nanmean(cur, dim=-1), dim=-1
+            )
         galileo_input = self.construct_galileo_input(**stacked_inputs, normalize=True)
         h = galileo_input.s_t_x.shape[1]
         if h < self.patch_size:
@@ -533,13 +502,14 @@ class GalileoModel(FeatureExtractor):
         # Decide context based on self.autocast_dtype.
         device = galileo_input.s_t_x.device
         if self.autocast_dtype is None:
-            torch_context = nullcontext()
+            context = nullcontext()
         else:
             assert device is not None
-            torch_context = torch.amp.autocast(
+            context = torch.amp.autocast(
                 device_type=device.type, dtype=self.autocast_dtype
             )
-        with torch_context:
+
+        with context:
             outputs = self.model(
                 s_t_x=galileo_input.s_t_x,
                 s_t_m=galileo_input.s_t_m,
@@ -560,20 +530,18 @@ class GalileoModel(FeatureExtractor):
             averaged = self.model.average_tokens(
                 s_t_x, sp_x, t_x, st_x, s_t_m, sp_m, t_m, st_m
             )
-            return FeatureMaps([repeat(averaged, "b d -> b d 1 1")])
+            return [repeat(averaged, "b d -> b d 1 1")]
         else:
             s_t_x = outputs[0]
             # we will be assuming we only want s_t_x, and (for now) that we want s1 or s2 bands
             # s_t_x has shape [b, h, w, t, c_g, d]
             # and we want [b, d, h, w]
-            return FeatureMaps(
-                [
-                    rearrange(
-                        s_t_x[:, :, :, :, s_t_channels, :].mean(dim=3),
-                        "b h w c_g d -> b c_g d h w",
-                    ).mean(dim=1)
-                ]
-            )
+            return [
+                rearrange(
+                    s_t_x[:, :, :, :, s_t_channels, :].mean(dim=3),
+                    "b h w c_g d -> b c_g d h w",
+                ).mean(dim=1)
+            ]
 
     def get_backbone_channels(self) -> list:
         """Returns the output channels of this model when used as a backbone.

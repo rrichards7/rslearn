@@ -4,8 +4,6 @@ from typing import Any
 
 import torch
 
-from rslearn.train.model_context import RasterImage
-
 from .transform import Transform
 
 
@@ -17,7 +15,6 @@ class Sentinel1ToDecibels(Transform):
         selectors: list[str] = ["image"],
         from_decibels: bool = False,
         epsilon: float = 1e-6,
-        skip_missing: bool = False,
     ):
         """Initialize a new Sentinel1ToDecibels.
 
@@ -28,15 +25,13 @@ class Sentinel1ToDecibels(Transform):
             epsilon: when converting to decibels, clip the intensities to this minimum
                 value to avoid log issues. This is mostly to avoid pixels that have no
                 data with no data value being 0.
-            skip_missing: if True, skip selectors that don't exist in the input/target
-                dicts. Useful when working with optional inputs.
         """
-        super().__init__(skip_missing=skip_missing)
+        super().__init__()
         self.selectors = selectors
         self.from_decibels = from_decibels
         self.epsilon = epsilon
 
-    def apply_image(self, image: RasterImage) -> RasterImage:
+    def apply_image(self, image: torch.Tensor) -> torch.Tensor:
         """Normalize the specified image.
 
         Args:
@@ -44,11 +39,10 @@ class Sentinel1ToDecibels(Transform):
         """
         if self.from_decibels:
             # Decibels to linear scale.
-            image.image = torch.pow(10.0, image.image / 10.0)
+            return torch.pow(10.0, image / 10.0)
         else:
             # Linear scale to decibels.
-            image.image = 10 * torch.log10(torch.clamp(image.image, min=self.epsilon))
-        return image
+            return 10 * torch.log10(torch.clamp(image, min=self.epsilon))
 
     def forward(
         self, input_dict: dict[str, Any], target_dict: dict[str, Any]

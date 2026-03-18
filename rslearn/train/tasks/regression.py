@@ -1,7 +1,5 @@
 """Regression task."""
 
-import warnings
-from collections.abc import Sequence
 from typing import Any, Literal
 
 import numpy as np
@@ -12,13 +10,6 @@ import torchmetrics
 from PIL import Image, ImageDraw
 from torchmetrics import Metric, MetricCollection
 
-from rslearn.models.component import FeatureVector, Predictor
-from rslearn.train.model_context import (
-    ModelContext,
-    ModelOutput,
-    RasterImage,
-    SampleMetadata,
-)
 from rslearn.utils.feature import Feature
 from rslearn.utils.geometry import STGeometry
 
@@ -34,14 +25,9 @@ class RegressionTask(BasicTask):
         filters: list[tuple[str, str]] | None = None,
         allow_invalid: bool = False,
         scale_factor: float = 1,
-        metric_mode: (
-            Literal["mse", "rmse", "l1", "mape"]
-            | Sequence[Literal["mse", "rmse", "l1", "mape"]]
-            | None
-        ) = None,
+        metric_mode: Literal["mse", "l1"] = "mse",
         use_accuracy_metric: bool = False,
         within_factor: float = 0.1,
-        metrics: Sequence[str] | None = None,
         **kwargs: Any,
     ) -> None:
         """Initialize a new RegressionTask.
@@ -54,14 +40,11 @@ class RegressionTask(BasicTask):
             allow_invalid: instead of throwing error when no regression label is found
                 at a window, simply mark the example invalid for this task
             scale_factor: multiply the label value by this factor for training
-            metric_mode: deprecated; use metrics instead. Will be removed after
-                2026-06-01.
+            metric_mode: what metric to use, either "mse" (default) or "l1"
             use_accuracy_metric: include metric that reports percentage of
                 examples where output is within a factor of the ground truth.
             within_factor: the factor for accuracy metric. If it's 0.2, and ground
                 truth is 5.0, then values from 5.0*0.8 to 5.0*1.2 are accepted.
-            metrics: metric(s) to compute. Supported values: "mse", "rmse", "l1",
-                "mape".
             kwargs: other arguments to pass to BasicTask
         """
         super().__init__(**kwargs)
@@ -69,38 +52,7 @@ class RegressionTask(BasicTask):
         self.filters = filters
         self.allow_invalid = allow_invalid
         self.scale_factor = scale_factor
-
-        if metrics is not None:
-            metric_names = list(metrics)
-            if metric_mode is not None:
-                warnings.warn(
-                    "RegressionTask.metric_mode is deprecated and ignored when "
-                    "`metrics` is set. It will be removed after 2026-06-01.",
-                    FutureWarning,
-                    stacklevel=2,
-                )
-        elif metric_mode is not None:
-            warnings.warn(
-                "RegressionTask.metric_mode is deprecated; use `metrics` instead. "
-                "It will be removed after 2026-06-01.",
-                FutureWarning,
-                stacklevel=2,
-            )
-            if isinstance(metric_mode, str):
-                metric_names = [metric_mode]
-            else:
-                metric_names = list(metric_mode)
-        else:
-            metric_names = ["mse"]
-
-        if len(metric_names) == 0:
-            raise ValueError("metrics must contain at least one metric")
-        allowed = {"mse", "rmse", "l1", "mape"}
-        invalid = [m for m in metric_names if m not in allowed]
-        if invalid:
-            raise ValueError(f"invalid metrics entries: {invalid}")
-        self.metrics = metric_names
-
+        self.metric_mode = metric_mode
         self.use_accuracy_metric = use_accuracy_metric
         self.within_factor = within_factor
 
@@ -109,8 +61,8 @@ class RegressionTask(BasicTask):
 
     def process_inputs(
         self,
-        raw_inputs: dict[str, RasterImage | list[Feature]],
-        metadata: SampleMetadata,
+        raw_inputs: dict[str, torch.Tensor | list[Feature]],
+        metadata: dict[str, Any],
         load_targets: bool = True,
     ) -> tuple[dict[str, Any], dict[str, Any]]:
         """Processes the data into targets.
@@ -128,7 +80,6 @@ class RegressionTask(BasicTask):
             return {}, {}
 
         data = raw_inputs["targets"]
-        assert isinstance(data, list)
         for feat in data:
             if feat.properties is None or self.filters is None:
                 continue
@@ -152,26 +103,22 @@ class RegressionTask(BasicTask):
         }
 
     def process_output(
-        self, raw_output: Any, metadata: SampleMetadata
-    ) -> list[Feature]:
+        self, raw_output: Any, metadata: dict[str, Any]
+    ) -> npt.NDArray[Any] | list[Feature]:
         """Processes an output into raster or vector data.
 
         Args:
-            raw_output: the output from prediction head, which must be a scalar tensor.
+            raw_output: the output from prediction head.
             metadata: metadata about the patch being read
 
         Returns:
-            a list with a single Feature corresponding to the patch extent and with a
-                property containing the predicted value.
+            either raster or vector data.
         """
-        if not isinstance(raw_output, torch.Tensor) or len(raw_output.shape) != 0:
-            raise ValueError("output for RegressionTask must be a scalar Tensor")
-
         output = raw_output.item() / self.scale_factor
         feature = Feature(
             STGeometry(
-                metadata.projection,
-                shapely.Point(metadata.crop_bounds[0], metadata.crop_bounds[1]),
+                metadata["projection"],
+                shapely.Point(metadata["bounds"][0], metadata["bounds"][1]),
                 None,
             ),
             {
@@ -215,29 +162,14 @@ class RegressionTask(BasicTask):
         """Get the metrics for this task."""
         metric_dict: dict[str, Metric] = {}
 
-        for metric_name in self.metrics:
-            if metric_name == "mse":
-                metric_dict["mse"] = RegressionMetricWrapper(
-                    metric=torchmetrics.MeanSquaredError(),
-                    scale_factor=self.scale_factor,
-                )
-            elif metric_name == "rmse":
-                metric_dict["rmse"] = RegressionMetricWrapper(
-                    metric=torchmetrics.MeanSquaredError(squared=False),
-                    scale_factor=self.scale_factor,
-                )
-            elif metric_name == "l1":
-                metric_dict["l1"] = RegressionMetricWrapper(
-                    metric=torchmetrics.MeanAbsoluteError(),
-                    scale_factor=self.scale_factor,
-                )
-            elif metric_name == "mape":
-                metric_dict["mape"] = RegressionMetricWrapper(
-                    metric=torchmetrics.MeanAbsolutePercentageError(),
-                    scale_factor=self.scale_factor,
-                )
-            else:
-                raise ValueError(f"unknown metric {metric_name}")
+        if self.metric_mode == "mse":
+            metric_dict["mse"] = RegressionMetricWrapper(
+                metric=torchmetrics.MeanSquaredError(), scale_factor=self.scale_factor
+            )
+        elif self.metric_mode == "l1":
+            metric_dict["l1"] = RegressionMetricWrapper(
+                metric=torchmetrics.MeanAbsoluteError(), scale_factor=self.scale_factor
+            )
 
         if self.use_accuracy_metric:
             metric_dict["accuracy"] = RegressionMetricWrapper(
@@ -248,57 +180,43 @@ class RegressionTask(BasicTask):
         return MetricCollection(metric_dict)
 
 
-class RegressionHead(Predictor):
+class RegressionHead(torch.nn.Module):
     """Head for regression task."""
 
     def __init__(
-        self,
-        loss_mode: Literal["mse", "l1", "huber"] = "mse",
-        use_sigmoid: bool = False,
-        huber_delta: float = 1.0,
+        self, loss_mode: Literal["mse", "l1"] = "mse", use_sigmoid: bool = False
     ):
         """Initialize a new RegressionHead.
 
         Args:
-            loss_mode: the loss function to use: "mse" (default), "l1", or "huber".
+            loss_mode: the loss function to use, either "mse" (default) or "l1".
             use_sigmoid: whether to apply a sigmoid activation on the output. This
                 requires targets to be between 0-1.
-            huber_delta: delta parameter for Huber loss (only used when
-                loss_mode="huber").
         """
         super().__init__()
         self.loss_mode = loss_mode
         self.use_sigmoid = use_sigmoid
-        self.huber_delta = huber_delta
 
     def forward(
         self,
-        intermediates: Any,
-        context: ModelContext,
+        logits: torch.Tensor,
+        inputs: list[dict[str, Any]],
         targets: list[dict[str, Any]] | None = None,
-    ) -> ModelOutput:
+    ) -> tuple[torch.Tensor, dict[str, Any]]:
         """Compute the regression outputs and loss from logits and targets.
 
         Args:
-            intermediates: output from previous model component, which must be a
-                FeatureVector with channel dimension size 1 (Bx1).
-            context: the model context.
-            targets: target dicts, which each must contain a "value" key containing the
-                regression label, along with a "valid" key containing a flag indicating
-                whether each example is valid for this task.
+            logits: tensor that is (BatchSize, 1) or (BatchSize) in shape.
+            inputs: original inputs (ignored).
+            targets: should contain target key that stores the regression label.
 
         Returns:
-            the model outputs. The output is a B tensor so that it is split up into a
-                scalar for each example.
+            tuple of outputs and loss dict
         """
-        if not isinstance(intermediates, FeatureVector):
-            raise ValueError("the input to RegressionHead must be a FeatureVector")
-        if intermediates.feature_vector.shape[1] != 1:
-            raise ValueError(
-                f"the input to RegressionHead must have channel dimension size 1, but got shape {intermediates.feature_vector.shape}"
-            )
-
-        logits = intermediates.feature_vector[:, 0]
+        assert len(logits.shape) in [1, 2]
+        if len(logits.shape) == 2:
+            assert logits.shape[1] == 1
+            logits = logits[:, 0]
 
         if self.use_sigmoid:
             outputs = torch.nn.functional.sigmoid(logits)
@@ -313,23 +231,10 @@ class RegressionHead(Predictor):
                 losses["regress"] = torch.mean(torch.square(outputs - labels) * mask)
             elif self.loss_mode == "l1":
                 losses["regress"] = torch.mean(torch.abs(outputs - labels) * mask)
-            elif self.loss_mode == "huber":
-                losses["regress"] = torch.mean(
-                    torch.nn.functional.huber_loss(
-                        outputs,
-                        labels,
-                        reduction="none",
-                        delta=self.huber_delta,
-                    )
-                    * mask
-                )
             else:
-                raise ValueError(f"unknown loss mode {self.loss_mode}")
+                assert False
 
-        return ModelOutput(
-            outputs=outputs,
-            loss_dict=losses,
-        )
+        return outputs, losses
 
 
 class RegressionMetricWrapper(Metric):

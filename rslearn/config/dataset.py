@@ -4,7 +4,7 @@ import copy
 import functools
 import json
 import warnings
-from datetime import datetime, timedelta
+from datetime import timedelta
 from enum import StrEnum
 from typing import TYPE_CHECKING, Annotated, Any
 
@@ -25,13 +25,12 @@ from rasterio.enums import Resampling
 from upath import UPath
 
 from rslearn.log_utils import get_logger
-from rslearn.utils.geometry import PixelBounds, Projection, ResolutionFactor
+from rslearn.utils import PixelBounds, Projection
 from rslearn.utils.raster_format import RasterFormat
 from rslearn.utils.vector_format import VectorFormat
 
 if TYPE_CHECKING:
     from rslearn.data_sources.data_source import DataSource
-    from rslearn.dataset.storage.storage import WindowStorageFactory
 
 logger = get_logger("__name__")
 
@@ -133,11 +132,7 @@ class BandSetConfig(BaseModel):
     bands.
     """
 
-    model_config = ConfigDict(extra="forbid")
-
-    dtype: DType = Field(
-        description="Pixel value type to store the data under. This is used during dataset materialize and model predict."
-    )
+    dtype: DType = Field(description="Pixel value type to store the data under")
     bands: list[str] = Field(
         default_factory=lambda: [],
         description="List of band names in this BandSetConfig. One of bands or num_bands must be set.",
@@ -166,7 +161,7 @@ class BandSetConfig(BaseModel):
 
     remap: dict[str, Any] | None = Field(
         default=None,
-        description="Optional configuration for a Remapper to remap pixel values.",
+        description="Optional jsonargparse configuration for a Remapper to remap pixel values.",
     )
 
     # Optional list of names for the different possible values of each band. The length
@@ -215,12 +210,22 @@ class BandSetConfig(BaseModel):
         Returns:
             tuple of updated projection and bounds with zoom offset applied
         """
-        if self.zoom_offset >= 0:
-            factor = ResolutionFactor(numerator=2**self.zoom_offset)
+        if self.zoom_offset == 0:
+            return projection, bounds
+        projection = Projection(
+            projection.crs,
+            projection.x_resolution / (2**self.zoom_offset),
+            projection.y_resolution / (2**self.zoom_offset),
+        )
+        if self.zoom_offset > 0:
+            zoom_factor = 2**self.zoom_offset
+            bounds = tuple(x * zoom_factor for x in bounds)  # type: ignore
         else:
-            factor = ResolutionFactor(denominator=2 ** (-self.zoom_offset))
-
-        return (factor.multiply_projection(projection), factor.multiply_bounds(bounds))
+            bounds = tuple(
+                x // (2 ** (-self.zoom_offset))
+                for x in bounds  # type: ignore
+            )
+        return projection, bounds
 
     @field_validator("format", mode="before")
     @classmethod
@@ -236,9 +241,11 @@ class BandSetConfig(BaseModel):
 
         warnings.warn(
             "`format = {'name': ...}` is deprecated; "
-            "use `{'class_path': '...', 'init_args': {...}}` instead. "
-            "Support will be removed after 2026-03-01.",
-            FutureWarning,
+            "use `{'class_path': '...', 'init_args': {...}}` instead.",
+            DeprecationWarning,
+        )
+        logger.warning(
+            "BandSet.format uses legacy format; support will be removed after 2026-03-01."
         )
 
         legacy_name_to_class_path = {
@@ -287,40 +294,42 @@ class SpaceMode(StrEnum):
     """
 
     PER_PERIOD_MOSAIC = "PER_PERIOD_MOSAIC"
-    """Deprecated: use MOSAIC with period_duration instead. Will be removed after 2026-05-01."""
+    """Create one mosaic per sub-period of the time range.
 
-    SINGLE_COMPOSITE = "SINGLE_COMPOSITE"
-    """Put all intersecting items into a single group.
-
-    This can be used together with compositing method to create one composite for the
-    layer.
+    The duration of the sub-periods is controlled by another option in QueryConfig.
     """
+
+    COMPOSITE = "COMPOSITE"
+    """Creates one composite covering the entire window.
+
+    During querying all items intersecting the window are placed in one group.
+    The compositing_method in the rasterlayer config specifies how these items are reduced
+    to a single item (e.g MEAN/MEDIAN/FIRST_VALID) during materialization.
+    """
+
+    # TODO add PER_PERIOD_COMPOSITE
 
 
 class TimeMode(StrEnum):
-    """Temporal matching mode when looking up items corresponding to a window.
-
-    Note: setting this is deprecated. It should always be set to TimeMode.WITHIN, and
-    TimeMode will be removed in a future release.
-    """
+    """Temporal  matching mode when looking up items corresponding to a window."""
 
     WITHIN = "WITHIN"
     """Items must be within the window time range."""
 
     NEAREST = "NEAREST"
-    """Deprecated: Select items closest to the window time range, up to max_matches."""
+    """Select items closest to the window time range, up to max_matches."""
 
     BEFORE = "BEFORE"
-    """Deprecated: Select items before the end of the window time range, up to max_matches."""
+    """Select items before the end of the window time range, up to max_matches."""
 
     AFTER = "AFTER"
-    """Deprecated: Select items after the start of the window time range, up to max_matches."""
+    """Select items after the start of the window time range, up to max_matches."""
 
 
 class QueryConfig(BaseModel):
     """A configuration for querying items in a data source."""
 
-    model_config = ConfigDict(frozen=True, extra="forbid")
+    model_config = ConfigDict(frozen=True)
 
     space_mode: SpaceMode = Field(
         default=SpaceMode.MOSAIC,
@@ -328,34 +337,8 @@ class QueryConfig(BaseModel):
     )
     time_mode: TimeMode = Field(
         default=TimeMode.WITHIN,
-        description="Deprecated: This option will be removed. Only WITHIN is supported.",
-        exclude=True,
+        description="Specifies how items should be matched with windows temporally.",
     )
-
-    @model_validator(mode="after")
-    def _warn_deprecated_fields(self) -> "QueryConfig":
-        if "time_mode" in self.model_fields_set:
-            warnings.warn(
-                "time_mode is deprecated and will be removed in a future version. "
-                "Remove it from your config (WITHIN is the only supported behavior).",
-                FutureWarning,
-                stacklevel=6,
-            )
-        if self.space_mode == SpaceMode.PER_PERIOD_MOSAIC:
-            warnings.warn(
-                "SpaceMode.PER_PERIOD_MOSAIC is deprecated and will be removed after "
-                "2026-05-01. Use SpaceMode.MOSAIC with period_duration instead.",
-                FutureWarning,
-                stacklevel=6,
-            )
-        if "per_period_mosaic_reverse_time_order" in self.model_fields_set:
-            warnings.warn(
-                "per_period_mosaic_reverse_time_order is deprecated and will be "
-                "removed after 2026-05-01.",
-                FutureWarning,
-                stacklevel=6,
-            )
-        return self
 
     # Minimum number of item groups. If there are fewer than this many matches, then no
     # matches will be returned. This can be used to prevent unnecessary data ingestion
@@ -365,43 +348,22 @@ class QueryConfig(BaseModel):
     )
 
     max_matches: int = Field(
-        default=1,
-        description="The maximum number of item groups. When period_duration is set, this "
-        "controls the maximum number of sub-periods for which item groups are created,"
-        "and within each sub-period, the matching strategy is applied with an effective "
-        "max_matches of 1 (i.e. one item group per sub-period).",
+        default=1, description="The maximum number of item groups."
     )
     period_duration: Annotated[
-        timedelta | None,
-        BeforeValidator(ensure_optional_timedelta),
+        timedelta,
+        BeforeValidator(ensure_timedelta),
         PlainSerializer(serialize_optional_timedelta),
     ] = Field(
-        default=None,
-        description="If set, split the window's time range into sub-periods of this duration. "
-        "The sub-period splitting takes effect before the SpaceMode, i.e., SpaceMode matching "
-        "operates within the sub-periods. Each sub-period produces a single separate item group, "
-        "up to max_matches total groups/periods.",
-    )
-    mosaic_compositing_overlaps: int = Field(
-        default=1,
-        description="For MOSAIC and PER_PERIOD_MOSAIC modes, the number of overlapping items "
-        "wanted within each item group covering the window. Set to 1 for a single coverage "
-        "(default mosaic behavior), or higher for compositing multiple overlapping items."
-        "with mean or median compositing method.",
-    )
-    per_period_mosaic_reverse_time_order: bool = Field(
-        default=True,
-        description="For PER_PERIOD_MOSAIC mode, whether to return item groups in reverse "
-        "temporal order (most recent first). Set to False for chronological order (oldest first). "
-        "Default True is deprecated and will change to False with error if still unset or set True "
-        "after 2026-04-01.",
+        default=timedelta(days=30),
+        description="The duration of the periods, if the space mode is PER_PERIOD_MOSAIC.",
     )
 
 
 class DataSourceConfig(BaseModel):
     """Configuration for a DataSource in a dataset layer."""
 
-    model_config = ConfigDict(frozen=True, extra="forbid")
+    model_config = ConfigDict(frozen=True)
 
     class_path: str = Field(description="Class path for the data source.")
     init_args: dict[str, Any] = Field(
@@ -433,29 +395,6 @@ class DataSourceConfig(BaseModel):
         description="Whether to ingest this layer (default True). If False, it will be directly materialized without ingestion.",
     )
 
-    def get_request_time_range(
-        self, window_time_range: tuple[datetime, datetime] | None
-    ) -> tuple[datetime, datetime] | None:
-        """Apply time_offset and duration to a window time range.
-
-        This converts a window's time range into the request time range that should be
-        used during prepare and materialize.
-
-        Args:
-            window_time_range: the window's original time range, or None.
-
-        Returns:
-            The adjusted time range, or None if the input was None.
-        """
-        if window_time_range is None:
-            return None
-        result = window_time_range
-        if self.time_offset:
-            result = (result[0] + self.time_offset, result[1] + self.time_offset)
-        if self.duration:
-            result = (result[0], result[0] + self.duration)
-        return result
-
     @model_validator(mode="before")
     @classmethod
     def convert_from_legacy(cls, d: dict[str, Any]) -> dict[str, Any]:
@@ -470,9 +409,11 @@ class DataSourceConfig(BaseModel):
 
         warnings.warn(
             "`Data source configuration {'name': ...}` is deprecated; "
-            "use `{'class_path': '...', 'init_args': {...}, ...}` instead. "
-            "Support will be removed after 2026-03-01.",
-            FutureWarning,
+            "use `{'class_path': '...', 'init_args': {...}, ...}` instead.",
+            DeprecationWarning,
+        )
+        logger.warning(
+            "Data source configuration uses legacy format; support will be removed after 2026-03-01."
         )
 
         # Split the dict into the base config that is in the pydantic model, and the
@@ -495,9 +436,8 @@ class DataSourceConfig(BaseModel):
             and "max_cloud_cover" in ds_init_args
         ):
             warnings.warn(
-                "Data source configuration specifies invalid 'max_cloud_cover' option."
-                "Support for ignoring this option will be removed after 2026-03-01.",
-                FutureWarning,
+                "Data source configuration specifies invalid 'max_cloud_cover' option.",
+                DeprecationWarning,
             )
             del ds_init_args["max_cloud_cover"]
 
@@ -514,13 +454,7 @@ class LayerType(StrEnum):
 
 
 class CompositingMethod(StrEnum):
-    """Method how to select pixels for the composite from corresponding items of a window.
-
-    For MEAN and MEDIAN modes, mosaic_compositing_overlaps (in the QueryConfig) should
-    be set higher than 1 so that rslearn creates item groups during prepare that cover
-    the window with multiple overlaps. At each pixel/band, the mean and median can then
-    be computed across items in each group that cover that pixel.
-    """
+    """Method how to select pixels for the composite from corresponding items of a window."""
 
     FIRST_VALID = "FIRST_VALID"
     """Select first valid pixel in order of corresponding items (might be sorted)"""
@@ -531,20 +465,11 @@ class CompositingMethod(StrEnum):
     MEDIAN = "MEDIAN"
     """Select per-pixel median value of corresponding items of a window"""
 
-    SPATIAL_MOSAIC_TEMPORAL_STACK = "SPATIAL_MOSAIC_TEMPORAL_STACK"
-    """Spatial first-valid compositing per timestep, stacked along T.
-
-    Items, which can contain multi-temporal rasters, are spatially composited using
-    first-valid logic within each timestep, but timesteps are stacked. The result is a
-    (C, T, H, W) RasterArray whose T dimension spans the union of all item timesteps,
-    clipped to the window time range.
-    """
-
 
 class LayerConfig(BaseModel):
     """Configuration of a layer in a dataset."""
 
-    model_config = ConfigDict(frozen=True, extra="forbid")
+    model_config = ConfigDict(frozen=True)
 
     type: LayerType = Field(description="The LayerType (raster or vector).")
     data_source: DataSourceConfig | None = Field(
@@ -667,60 +592,11 @@ class LayerConfig(BaseModel):
         return vector_format
 
 
-class StorageConfig(BaseModel):
-    """Configuration for the WindowStorageFactory (window metadata storage backend)."""
-
-    model_config = ConfigDict(frozen=True, extra="forbid")
-
-    class_path: str = Field(
-        default="rslearn.dataset.storage.file.FileWindowStorageFactory",
-        description="Class path for the WindowStorageFactory.",
-    )
-    init_args: dict[str, Any] = Field(
-        default_factory=lambda: {},
-        description="jsonargparse init args for the WindowStorageFactory.",
-    )
-
-    def instantiate_window_storage_factory(self) -> "WindowStorageFactory":
-        """Instantiate the WindowStorageFactory specified by this config."""
-        from rslearn.dataset.storage.storage import WindowStorageFactory
-        from rslearn.utils.jsonargparse import init_jsonargparse
-
-        init_jsonargparse()
-        parser = jsonargparse.ArgumentParser()
-        parser.add_argument("--wsf", type=WindowStorageFactory)
-        cfg = parser.parse_object(
-            {
-                "wsf": dict(
-                    class_path=self.class_path,
-                    init_args=self.init_args,
-                )
-            }
-        )
-        wsf = parser.instantiate_classes(cfg).wsf
-        return wsf
-
-
 class DatasetConfig(BaseModel):
     """Overall dataset configuration."""
-
-    model_config = ConfigDict(extra="forbid")
 
     layers: dict[str, LayerConfig] = Field(description="Layers in the dataset.")
     tile_store: dict[str, Any] = Field(
         default={"class_path": "rslearn.tile_stores.default.DefaultTileStore"},
         description="jsonargparse configuration for the TileStore.",
     )
-    storage: StorageConfig = Field(
-        default_factory=lambda: StorageConfig(),
-        description="jsonargparse configuration for the WindowStorageFactory.",
-    )
-
-    @field_validator("layers", mode="after")
-    @classmethod
-    def layer_names_validator(cls, v: dict[str, LayerConfig]) -> dict[str, LayerConfig]:
-        """Ensure layer names don't contain periods, since we use periods to distinguish different materialized groups within a layer."""
-        for layer_name in v.keys():
-            if "." in layer_name:
-                raise ValueError(f"layer names must not contain periods: {layer_name}")
-        return v

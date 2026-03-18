@@ -2,7 +2,6 @@ import pytest
 import torch
 
 from rslearn.models.molmo import Molmo
-from rslearn.train.model_context import RasterImage
 
 
 @pytest.mark.parametrize(
@@ -13,7 +12,7 @@ def test_molmo(model_name: str) -> None:
     molmo = Molmo(model_name=model_name)
     inputs = [
         {
-            "image": RasterImage(torch.zeros((3, 1, 32, 32), dtype=torch.float32)),
+            "image": torch.zeros((3, 32, 32), dtype=torch.float32),
         }
     ]
     feature_list = molmo(inputs)

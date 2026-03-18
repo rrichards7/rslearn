@@ -5,6 +5,7 @@ import os
 import tempfile
 import zipfile
 from datetime import UTC, datetime, timedelta
+from typing import Any
 
 import fiona
 import requests
@@ -152,7 +153,7 @@ class EuroCrops(DataSource[EuroCropsItem]):
             groups.append(cur_groups)
         return groups
 
-    def deserialize_item(self, serialized_item: dict) -> EuroCropsItem:
+    def deserialize_item(self, serialized_item: Any) -> EuroCropsItem:
         """Deserializes an item from JSON-decoded data."""
         return EuroCropsItem.deserialize(serialized_item)
 
@@ -228,7 +229,7 @@ class EuroCrops(DataSource[EuroCropsItem]):
             geometries: a list of geometries needed for each item
         """
         for item in items:
-            if tile_store.is_vector_ready(item):
+            if tile_store.is_vector_ready(item.name):
                 continue
 
             # Get features across all shapefiles.
@@ -238,4 +239,4 @@ class EuroCrops(DataSource[EuroCropsItem]):
                 features.extend(self._extract_features(fname))
 
             logger.debug(f"Writing features for {item.name} to the tile store")
-            tile_store.write_vector(item, features)
+            tile_store.write_vector(item.name, features)

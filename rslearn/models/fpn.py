@@ -1,16 +1,12 @@
 """Feature pyramid network."""
 
 import collections
-from typing import Any
 
+import torch
 import torchvision
 
-from rslearn.train.model_context import ModelContext
 
-from .component import FeatureMaps, IntermediateComponent
-
-
-class Fpn(IntermediateComponent):
+class Fpn(torch.nn.Module):
     """A feature pyramid network (FPN).
 
     The FPN inputs a multi-scale feature map. At each scale, it computes new features
@@ -36,27 +32,20 @@ class Fpn(IntermediateComponent):
             in_channels_list=in_channels, out_channels=out_channels
         )
 
-    def forward(self, intermediates: Any, context: ModelContext) -> FeatureMaps:
+    def forward(self, x: list[torch.Tensor]) -> list[torch.Tensor]:
         """Compute outputs of the FPN.
 
         Args:
-            intermediates: the output from the previous component, which must be a FeatureMaps.
-            context: the model context.
+            x: the multi-scale feature maps
 
         Returns:
-            new multi-scale feature maps from the FPN.
+            new multi-scale feature maps from the FPN
         """
-        if not isinstance(intermediates, FeatureMaps):
-            raise ValueError("input to Fpn must be FeatureMaps")
-
-        feature_maps = intermediates.feature_maps
-        inp = collections.OrderedDict(
-            [(f"feat{i}", el) for i, el in enumerate(feature_maps)]
-        )
+        inp = collections.OrderedDict([(f"feat{i}", el) for i, el in enumerate(x)])
         output = self.fpn(inp)
         output = list(output.values())
 
         if self.prepend:
-            return FeatureMaps(output + feature_maps)
+            return output + x
         else:
-            return FeatureMaps(output)
+            return output

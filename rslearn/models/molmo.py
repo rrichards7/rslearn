@@ -1,14 +1,12 @@
 """Molmo model."""
 
+from typing import Any
+
 import torch
 from transformers import AutoModelForCausalLM, AutoProcessor
 
-from rslearn.train.model_context import ModelContext
 
-from .component import FeatureExtractor, FeatureMaps
-
-
-class Molmo(FeatureExtractor):
+class Molmo(torch.nn.Module):
     """Molmo image encoder."""
 
     def __init__(
@@ -36,24 +34,22 @@ class Molmo(FeatureExtractor):
         )  # nosec
         self.encoder = model.model.vision_backbone
 
-    def forward(self, context: ModelContext) -> FeatureMaps:
+    def forward(self, inputs: list[dict[str, Any]]) -> list[torch.Tensor]:
         """Compute outputs from the backbone.
 
-        Args:
-            context: the model context. Input dicts must include "image" key containing
-                the image to process. The images should have values 0-255.
+        Inputs:
+            inputs: input dicts that must include "image" key containing the image to
+                process. The images should have values 0-255.
 
         Returns:
-            a FeatureMaps. Molmo produces features at one scale, so it will contain one
-                feature map that is a Bx24x24x2048 tensor.
+            list of feature maps. Molmo produces features at one scale, so the list
+                contains a single Bx24x24x2048 tensor.
         """
-        device = context.inputs[0]["image"].image.device
+        device = inputs[0]["image"].device
         molmo_inputs_list = []
         # Process each one so we can isolate just the full image without any crops.
-        for inp in context.inputs:
-            image = (
-                inp["image"].single_ts_to_chw_tensor().cpu().numpy().transpose(1, 2, 0)
-            )
+        for inp in inputs:
+            image = inp["image"].cpu().numpy().transpose(1, 2, 0)
             processed = self.processor.process(
                 images=[image],
                 text="",
@@ -64,6 +60,6 @@ class Molmo(FeatureExtractor):
         image_features, _ = self.encoder.encode_image(molmo_inputs.to(device))
 
         # 576x2048 -> 24x24x2048
-        return FeatureMaps(
-            [image_features[:, 0, :, :].reshape(-1, 24, 24, 2048).permute(0, 3, 1, 2)]
-        )
+        return [
+            image_features[:, 0, :, :].reshape(-1, 24, 24, 2048).permute(0, 3, 1, 2)
+        ]

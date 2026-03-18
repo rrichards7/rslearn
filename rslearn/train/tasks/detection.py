@@ -12,11 +12,27 @@ import torchmetrics.classification
 import torchvision
 from torchmetrics import Metric, MetricCollection
 
-from rslearn.train.model_context import RasterImage, SampleMetadata
 from rslearn.utils import Feature, STGeometry
-from rslearn.utils.colors import DEFAULT_COLORS
 
 from .task import BasicTask
+
+DEFAULT_COLORS = [
+    (255, 0, 0),
+    (0, 255, 0),
+    (0, 0, 255),
+    (255, 255, 0),
+    (0, 255, 255),
+    (255, 0, 255),
+    (0, 128, 0),
+    (255, 160, 122),
+    (139, 69, 19),
+    (128, 128, 128),
+    (255, 255, 255),
+    (143, 188, 143),
+    (95, 158, 160),
+    (255, 200, 0),
+    (128, 0, 0),
+]
 
 
 class DetectionTask(BasicTask):
@@ -110,8 +126,8 @@ class DetectionTask(BasicTask):
 
     def process_inputs(
         self,
-        raw_inputs: dict[str, RasterImage | list[Feature]],
-        metadata: SampleMetadata,
+        raw_inputs: dict[str, torch.Tensor | list[Feature]],
+        metadata: dict[str, Any],
         load_targets: bool = True,
     ) -> tuple[dict[str, Any], dict[str, Any]]:
         """Processes the data into targets.
@@ -128,14 +144,11 @@ class DetectionTask(BasicTask):
         if not load_targets:
             return {}, {}
 
-        bounds = metadata.crop_bounds
-
         boxes = []
         class_labels = []
         valid = 1
 
         data = raw_inputs["targets"]
-        assert isinstance(data, list)
         for feat in data:
             if feat.properties is None:
                 continue
@@ -173,33 +186,39 @@ class DetectionTask(BasicTask):
             else:
                 box = [int(val) for val in shp.bounds]
 
-            if box[0] >= bounds[2] or box[2] <= bounds[0]:
+            if box[0] >= metadata["bounds"][2] or box[2] <= metadata["bounds"][0]:
                 continue
-            if box[1] >= bounds[3] or box[3] <= bounds[1]:
+            if box[1] >= metadata["bounds"][3] or box[3] <= metadata["bounds"][1]:
                 continue
 
             if self.exclude_by_center:
                 center_col = (box[0] + box[2]) // 2
                 center_row = (box[1] + box[3]) // 2
-                if center_col <= bounds[0] or center_col >= bounds[2]:
+                if (
+                    center_col <= metadata["bounds"][0]
+                    or center_col >= metadata["bounds"][2]
+                ):
                     continue
-                if center_row <= bounds[1] or center_row >= bounds[3]:
+                if (
+                    center_row <= metadata["bounds"][1]
+                    or center_row >= metadata["bounds"][3]
+                ):
                     continue
 
             if self.clip_boxes:
                 box = [
-                    np.clip(box[0], bounds[0], bounds[2]),
-                    np.clip(box[1], bounds[1], bounds[3]),
-                    np.clip(box[2], bounds[0], bounds[2]),
-                    np.clip(box[3], bounds[1], bounds[3]),
+                    np.clip(box[0], metadata["bounds"][0], metadata["bounds"][2]),
+                    np.clip(box[1], metadata["bounds"][1], metadata["bounds"][3]),
+                    np.clip(box[2], metadata["bounds"][0], metadata["bounds"][2]),
+                    np.clip(box[3], metadata["bounds"][1], metadata["bounds"][3]),
                 ]
 
             # Convert to relative coordinates.
             box = [
-                box[0] - bounds[0],
-                box[1] - bounds[1],
-                box[2] - bounds[0],
-                box[3] - bounds[1],
+                box[0] - metadata["bounds"][0],
+                box[1] - metadata["bounds"][1],
+                box[2] - metadata["bounds"][0],
+                box[3] - metadata["bounds"][1],
             ]
 
             boxes.append(box)
@@ -219,12 +238,16 @@ class DetectionTask(BasicTask):
             "valid": torch.tensor(valid, dtype=torch.int32),
             "boxes": boxes,
             "labels": class_labels,
-            "width": torch.tensor(bounds[2] - bounds[0], dtype=torch.float32),
-            "height": torch.tensor(bounds[3] - bounds[1], dtype=torch.float32),
+            "width": torch.tensor(
+                metadata["bounds"][2] - metadata["bounds"][0], dtype=torch.float32
+            ),
+            "height": torch.tensor(
+                metadata["bounds"][3] - metadata["bounds"][1], dtype=torch.float32
+            ),
         }
 
     def process_output(
-        self, raw_output: Any, metadata: SampleMetadata
+        self, raw_output: Any, metadata: dict[str, Any]
     ) -> npt.NDArray[Any] | list[Feature]:
         """Processes an output into raster or vector data.
 
@@ -244,12 +267,12 @@ class DetectionTask(BasicTask):
         features = []
         for box, class_id, score in zip(boxes, class_ids, scores):
             shp = shapely.box(
-                metadata.crop_bounds[0] + float(box[0]),
-                metadata.crop_bounds[1] + float(box[1]),
-                metadata.crop_bounds[0] + float(box[2]),
-                metadata.crop_bounds[1] + float(box[3]),
+                metadata["bounds"][0] + float(box[0]),
+                metadata["bounds"][1] + float(box[1]),
+                metadata["bounds"][0] + float(box[2]),
+                metadata["bounds"][1] + float(box[3]),
             )
-            geom = STGeometry(metadata.projection, shp, None)
+            geom = STGeometry(metadata["projection"], shp, None)
             properties: dict[str, Any] = {
                 "score": float(score),
             }

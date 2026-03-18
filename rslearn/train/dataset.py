@@ -1,16 +1,13 @@
 """Default Dataset for rslearn."""
 
-import dataclasses
 import hashlib
 import json
+import multiprocessing
 import os
 import random
 import tempfile
 import time
 import uuid
-import warnings
-from datetime import datetime
-from enum import StrEnum
 from typing import Any
 
 import torch
@@ -21,41 +18,18 @@ import rslearn.train.transforms.transform
 from rslearn.config import (
     DType,
     LayerConfig,
-    SpaceMode,
 )
-from rslearn.data_sources.data_source import Item
 from rslearn.dataset.dataset import Dataset
-from rslearn.dataset.storage.file import FileWindowStorage
-from rslearn.dataset.window import (
-    Window,
-    WindowLayerData,
-    get_layer_and_group_from_dir_name,
-)
+from rslearn.dataset.window import Window, get_layer_and_group_from_dir_name
 from rslearn.log_utils import get_logger
-from rslearn.train.dataset_index import DatasetIndex
-from rslearn.train.model_context import RasterImage
+from rslearn.train.tasks import Task
 from rslearn.utils.feature import Feature
-from rslearn.utils.geometry import PixelBounds, ResolutionFactor
-from rslearn.utils.mp import make_pool_and_star_imap_unordered
+from rslearn.utils.geometry import PixelBounds
+from rslearn.utils.mp import star_imap_unordered
 
-from .model_context import SampleMetadata
-from .tasks import Task
 from .transforms import Sequential
 
 logger = get_logger(__name__)
-
-
-class IndexMode(StrEnum):
-    """Controls dataset index caching behavior."""
-
-    OFF = "off"
-    """No caching - always load windows from dataset."""
-
-    USE = "use"
-    """Use cached index if available, create if not."""
-
-    REFRESH = "refresh"
-    """Ignore existing cache and rebuild."""
 
 
 def get_torch_dtype(dtype: DType) -> torch.dtype:
@@ -66,84 +40,6 @@ def get_torch_dtype(dtype: DType) -> torch.dtype:
         return torch.float32
     else:
         raise ValueError(f"unable to handle {dtype} as a torch dtype")
-
-
-def compute_expected_timestamps(
-    window: Window,
-    layer_config: LayerConfig,
-) -> list[tuple[datetime, datetime]] | None:
-    """Compute expected timestamps from window time_range and layer config.
-
-    This function derives the theoretical timestamps expected for a layer based on
-    the window's time range and the layer's query configuration. This allows models
-    to identify which timesteps are present vs missing and insert missing timesteps
-    at the correct temporal positions.
-
-    Args:
-        window: the window containing the time range.
-        layer_config: the layer configuration with data source and query config.
-
-    Returns:
-        A list of (start, end) datetime tuples representing expected timestamps,
-        sorted in chronological order (oldest first). Returns None if expected
-        timestamps cannot be computed (e.g., no time range or data source config).
-    """
-    if window.time_range is None:
-        return None
-
-    if layer_config.data_source is None:
-        return None
-
-    data_source_cfg = layer_config.data_source
-    query_config = data_source_cfg.query_config
-
-    # Apply temporal modifiers from data source config
-    time_range_start = window.time_range[0]
-    time_range_end = window.time_range[1]
-
-    if data_source_cfg.time_offset:
-        time_range_start = time_range_start + data_source_cfg.time_offset
-        time_range_end = time_range_end + data_source_cfg.time_offset
-
-    if data_source_cfg.duration:
-        time_range_end = time_range_start + data_source_cfg.duration
-
-    # For PER_PERIOD_MOSAIC mode, compute periods aligned from the end backwards
-    if query_config.space_mode == SpaceMode.PER_PERIOD_MOSAIC:
-        period_duration = query_config.period_duration
-        if period_duration is None:
-            return None
-        max_matches = query_config.max_matches
-
-        # If the window has more periods than max_matches, the actual periods
-        # selected depend on data availability, so return None
-        total_periods = (time_range_end - time_range_start) // period_duration
-        if total_periods > max_matches:
-            return None
-
-        # Compute periods aligned from end backwards (matching data_sources/utils.py logic)
-        expected_timestamps: list[tuple[datetime, datetime]] = []
-        period_start = time_range_end - period_duration
-        while (
-            period_start >= time_range_start and len(expected_timestamps) < max_matches
-        ):
-            period_time_range = (period_start, period_start + period_duration)
-            expected_timestamps.append(period_time_range)
-            period_start = period_start - period_duration
-
-        # Reverse to get chronological order (oldest first)
-        expected_timestamps.reverse()
-        return expected_timestamps
-
-    # For non-PER_PERIOD_MOSAIC modes with max_matches > 1, we can't easily determine
-    # expected timestamps without knowing the actual items. In this case, return None
-    # and let the model handle alignment based on actual timestamps.
-    if query_config.max_matches > 1:
-        return None
-
-    # For single-timestep modes (max_matches=1), the expected timestamp is the window's
-    # time range (after applying modifiers).
-    return [(time_range_start, time_range_end)]
 
 
 class SamplerFactory:
@@ -232,10 +128,6 @@ class DataInput:
     """Specification of a piece of data from a window that is needed for training.
 
     The DataInput includes which layer(s) the data can be obtained from for each window.
-
-    Note that this class is not a dataclass because jsonargparse does not play well
-    with dataclasses without enabling specialized options which we have not validated
-    will work with the rest of our code.
     """
 
     def __init__(
@@ -243,124 +135,45 @@ class DataInput:
         data_type: str,
         layers: list[str],
         bands: list[str] | None = None,
-        use_all_bands_in_order_of_band_set_idx: int | None = None,
         required: bool = True,
         passthrough: bool = False,
         is_target: bool = False,
         dtype: DType = DType.FLOAT32,
         load_all_layers: bool = False,
         load_all_item_groups: bool = False,
-        resolution_factor: ResolutionFactor = ResolutionFactor(),
-        resampling: Resampling = Resampling.nearest,
-    ):
+    ) -> None:
         """Initialize a new DataInput.
 
         Args:
             data_type: either "raster" or "vector"
-            layers: list of layer names or item group specifiers that this input can be
-                read from. If load_all_item_groups=False, each entry should be an item
-                group specifier (e.g. "sentinel2" for layer_name=sentinel2, group_idx=0
-                or "sentinel2.1" for layer_name=sentinel2, group_idx=1). Otherwise,
-                each entry should be a layer name. For example, if you have a layer
-                "sentinel2" with three item groups: with load_all_item_groups=False,
-                set layers=["sentinel2", "sentinel2.1", "sentinel2.2"]; with
-                load_all_item_groups=True, set layers=["sentinel2"].
+            layers: list of layer names that this input can be read from.
             bands: the bands to read, if this is a raster.
-            use_all_bands_in_order_of_band_set_idx: if set, read all bands from the
-                specified layer_config band_set index (ordered as listed in that
-                band_set). This is useful for large embedding layers where listing all
-                band names in model config is cumbersome.
             required: whether examples lacking one of these layers should be skipped
             passthrough: whether to expose this to the model even if it isn't returned
                 by any task
             is_target: whether this DataInput represents a target for the task. Targets
                 are not read during prediction phase.
             dtype: data type to load the raster as
-            load_all_layers: whether to load all of the entries specified in the layers
-                list. By default, we randomly pick one entry to read. When reading
-                multiple entries, raster images are stacked on the time dimension. This
-                option will also cause the dataset to only include windows where all of
-                the entries are materialized (by default, only windows with none of the
-                entries materialized would be excluded).
+            load_all_layers: whether to load all of the layers specified in the list of
+                layer names. By default, we randomly pick one layer to read. When
+                reading multiple layers, the images are stacked on the channel
+                dimension. This option will also cause the dataset to only include
+                windows where all of the layers are materialized (by default, only
+                windows with none of the layers materialized would be excluded).
             load_all_item_groups: whether to load all item groups in the layer(s) we
-                are reading from. By default, we treat layers as a list of item group
-                specifiers, and either pick a random item group to read (if
-                load_all_layers=False) or stack all of them (if load_all_layers=True). If
-                load_all_item_groups=True, we treat layers as a list of layer names,
-                and include all item groups within each layer as candidates for
-                reading; whether we pick a random item group or stack them is still
-                controlled by load_all_layers. Note that, when load_all_layers=True and
-                load_all_item_groups=True, we will only exclude windows from training
-                that have zero item groups in one of the configured layers; additionally,
-                if windows have different numbers of item groups, then we will read
-                RasterImages with different numbers of timesteps.
-            resolution_factor: controls the resolution at which raster data is loaded for training.
-                By default (factor=1), data is loaded at the window resolution.
-                E.g. for a 64x64 window at 10 m/pixel with resolution_factor=1/2,
-                the resulting tensor is 32x32 (covering the same geographic area at 20 m/pixel).
-            resampling: resampling method (default nearest neighbor).
+                are reading from. By default, we assume the specified layer name is of
+                the form "{layer_name}.{group_idx}" and read that item group only. With
+                this option enabled, we ignore the group_idx and read all item groups.
         """
         self.data_type = data_type
         self.layers = layers
+        self.bands = bands
         self.required = required
         self.passthrough = passthrough
         self.is_target = is_target
         self.dtype = dtype
         self.load_all_layers = load_all_layers
         self.load_all_item_groups = load_all_item_groups
-        self.resolution_factor = resolution_factor
-        self.resampling = resampling
-
-        if bands is not None and use_all_bands_in_order_of_band_set_idx is not None:
-            raise ValueError(
-                "only one of bands and use_all_bands_in_order_of_band_set_idx should be set"
-            )
-        if (
-            self.data_type == "raster"
-            and bands is None
-            and use_all_bands_in_order_of_band_set_idx is None
-        ):
-            raise ValueError(
-                "for raster DataInputs, one of bands and use_all_bands_in_order_of_band_set_idx must be set"
-            )
-
-        self.bands = bands
-        self.use_all_bands_in_order_of_band_set_idx = (
-            use_all_bands_in_order_of_band_set_idx
-        )
-
-
-def resolve_raster_data_input_bands(
-    data_input: DataInput,
-    layer_name: str,
-    layer_config: LayerConfig,
-) -> list[str]:
-    """Resolve the band list for a raster DataInput.
-
-    If data_input.bands is explicitly provided, it is returned as-is. Otherwise, if
-    use_all_bands_in_order_of_band_set_idx is set, all bands are taken from that
-    specific band set in the dataset's LayerConfig.
-    """
-    if data_input.bands is not None:
-        return data_input.bands
-
-    band_set_index = data_input.use_all_bands_in_order_of_band_set_idx
-    if band_set_index is None:
-        raise ValueError(
-            f"No bands specified for raster input when reading layer '{layer_name}'. "
-            "Set `bands: [...]`, or set `use_all_bands_in_order_of_band_set_idx` "
-            "to a band set index to use all band names from the dataset layer config."
-        )
-
-    if band_set_index < 0 or band_set_index >= len(layer_config.band_sets):
-        raise ValueError(
-            "Invalid "
-            f"use_all_bands_in_order_of_band_set_idx={band_set_index} "
-            f"for layer '{layer_name}'. "
-            f"Expected a value in [0, {len(layer_config.band_sets) - 1}]."
-        )
-
-    return layer_config.band_sets[band_set_index].bands
 
 
 def read_raster_layer_for_data_input(
@@ -370,31 +183,28 @@ def read_raster_layer_for_data_input(
     group_idx: int,
     layer_config: LayerConfig,
     data_input: DataInput,
-) -> tuple[torch.Tensor, list[tuple[datetime, datetime]] | None]:
-    """Read a raster layer from a specific item group for a DataInput.
+) -> torch.Tensor:
+    """Read a raster layer for a DataInput.
 
     This scans the available rasters for the layer at the window to determine which
-    ones are needed to get all of the configured bands. All timesteps are preserved.
+    ones are needed to get all of the configured bands.
 
     Args:
         window: the window to read from.
         bounds: the bounds to read.
-        layer_name: the layer name.
-        group_idx: the item group index within the layer.
+        layer_name: the layer.
+        group_idx: the item group.
         layer_config: the layer configuration.
         data_input: the DataInput that specifies the bands and dtype.
 
     Returns:
-        Tuple of (CTHW tensor, timestamps). Timestamps may be None if the raster
-        format did not store them.
+        tensor containing raster data.
     """
     # See what different sets of bands we need to read to get all the
     # configured bands.
-    needed_bands = resolve_raster_data_input_bands(
-        data_input=data_input,
-        layer_name=layer_name,
-        layer_config=layer_config,
-    )
+    needed_bands = data_input.bands
+    if needed_bands is None:
+        raise ValueError(f"No bands specified for {layer_name}")
     needed_band_indexes = {}
     for i, band in enumerate(needed_bands):
         needed_band_indexes[band] = i
@@ -421,19 +231,15 @@ def read_raster_layer_for_data_input(
             + f"window {window.name} layer {layer_name} group {group_idx}"
         )
 
-    # Get the projection and bounds to read under (multiply window resolution # by
-    # the specified resolution factor).
-    final_projection = data_input.resolution_factor.multiply_projection(
-        window.projection
+    image = torch.zeros(
+        (len(needed_bands), bounds[3] - bounds[1], bounds[2] - bounds[0]),
+        dtype=get_torch_dtype(data_input.dtype),
     )
-    final_bounds = data_input.resolution_factor.multiply_bounds(bounds)
-
-    # We don't know T upfront (it depends on the stored raster), so we allocate
-    # the output tensor after reading the first band set.
-    image: torch.Tensor | None = None
-    timestamps: list[tuple[datetime, datetime]] | None = None
 
     for band_set, src_indexes, dst_indexes in needed_sets_and_indexes:
+        final_projection, final_bounds = band_set.get_final_projection_and_bounds(
+            window.projection, bounds
+        )
         if band_set.format is None:
             raise ValueError(f"No format specified for {layer_name}")
         raster_format = band_set.instantiate_raster_format()
@@ -441,81 +247,49 @@ def read_raster_layer_for_data_input(
             layer_name, band_set.bands, group_idx=group_idx
         )
 
-        # TODO: previously we try to read based on band_set.zoom_offset when possible,
-        # and handle zooming in with torch.repeat (if resampling method is nearest
-        # neighbor). However, we have not benchmarked whether this actually improves
-        # data loading speed, so for simplicity, for now we let rasterio handle the
-        # resampling. If it really is much faster to handle it via torch, then it may
-        # make sense to bring back that functionality.
-
-        raster_array = raster_format.decode_raster(
-            raster_dir, final_projection, final_bounds, resampling=Resampling.nearest
-        )
-        src = raster_array.array  # (C, T, H, W)
-
-        if image is None:
-            t = src.shape[1]
-            image = torch.zeros(
-                (
-                    len(needed_bands),
-                    t,
-                    final_bounds[3] - final_bounds[1],
-                    final_bounds[2] - final_bounds[0],
-                ),
-                dtype=get_torch_dtype(data_input.dtype),
+        # Previously we always read in the native projection of the data, and then
+        # zoom in or out (the resolution must be a power of two off) to match the
+        # window's resolution.
+        # However, this fails if the bounds are not multiples of the resolution factor.
+        # So we fallback to reading directly in the window projection if that is the
+        # case (which may be a bit slower).
+        is_bounds_zoomable = True
+        if band_set.zoom_offset < 0:
+            zoom_factor = 2 ** (-band_set.zoom_offset)
+            is_bounds_zoomable = (final_bounds[2] - final_bounds[0]) * zoom_factor == (
+                bounds[2] - bounds[0]
+            ) and (final_bounds[3] - final_bounds[1]) * zoom_factor == (
+                bounds[3] - bounds[1]
             )
-            timestamps = raster_array.timestamps
 
-        image[dst_indexes, :, :, :] = torch.as_tensor(
-            src[src_indexes, :, :, :].astype(data_input.dtype.get_numpy_dtype())
-        )
-
-    if image is None:
-        raise RuntimeError(
-            f"No band sets were read for layer {layer_name} group {group_idx} "
-            f"in window {window.name}, but found all needed bands"
-        )
-
-    return image, timestamps
-
-
-def read_layer_time_range(
-    layer_data: WindowLayerData | None, group_idx: int
-) -> tuple[datetime, datetime] | None:
-    """Extract the combined time range from all items in a layer data group.
-
-    Returns the min start time and max end time across all items, or None if
-    no items have time ranges.
-
-    Raises:
-        ValueError: If some items have time_range and others don't.
-    """
-    if layer_data is None:
-        return None
-
-    serialized_items = layer_data.serialized_item_groups[group_idx]
-    if not serialized_items:
-        return None
-
-    first_item = Item.deserialize(serialized_items[0])
-    if first_item.geometry.time_range is None:
-        return None
-
-    # If the first item has a time_range, all items must have one
-    time_ranges: list[tuple[datetime, datetime]] = []
-    for serialized_item in serialized_items:
-        item = Item.deserialize(serialized_item)
-        if item.geometry.time_range is None:
-            raise ValueError(
-                f"Item '{item.name}' has no time_range, but first item does. "
-                "All items in a group must consistently have or lack time_range."
+        if is_bounds_zoomable:
+            src = raster_format.decode_raster(
+                raster_dir, final_projection, final_bounds
             )
-        time_ranges.append(item.geometry.time_range)
 
-    return (
-        min(tr[0] for tr in time_ranges),
-        max(tr[1] for tr in time_ranges),
-    )
+            # Resize to patch size if needed.
+            # This is for band sets that are stored at a lower resolution.
+            # Here we assume that it is a multiple.
+            if src.shape[1:3] != image.shape[1:3]:
+                if src.shape[1] < image.shape[1]:
+                    factor = image.shape[1] // src.shape[1]
+                    src = src.repeat(repeats=factor, axis=1).repeat(
+                        repeats=factor, axis=2
+                    )
+                else:
+                    factor = src.shape[1] // image.shape[1]
+                    src = src[:, ::factor, ::factor]
+
+        else:
+            src = raster_format.decode_raster(
+                raster_dir, window.projection, bounds, resampling=Resampling.nearest
+            )
+
+        image[dst_indexes, :, :] = torch.as_tensor(
+            src[src_indexes, :, :].astype(data_input.dtype.get_numpy_dtype())
+        )
+
+    return image
 
 
 def read_data_input(
@@ -524,7 +298,7 @@ def read_data_input(
     bounds: PixelBounds,
     data_input: DataInput,
     rng: random.Random,
-) -> RasterImage | list[Feature]:
+) -> torch.Tensor | list[Feature]:
     """Read the data specified by the DataInput from the window.
 
     Args:
@@ -537,24 +311,16 @@ def read_data_input(
     Returns:
         the raster or vector data.
     """
-    # We first enumerate which item groups are available.
-    # If load_all_item_groups is set, we discover all item groups within each layer.
-    # Otherwise, we parse each entry in data_input.layers as a (layer_name, group_idx)
-    # specifier.
+    # We first enumerate which layers are available.
+    # If load_all_item_groups is set, we need to check each item group within the
+    # layer.
     layer_options: list[tuple[str, int]] = []
     if data_input.load_all_item_groups:
-        # We ensure that item groups are ordered within each layer, and across layers
-        # we respect the user's given order.
-        completed_groups_by_layer: dict[str, list[int]] = {}
+        wanted_layers = set(data_input.layers)
         for layer_name, group_idx in window.list_completed_layers():
-            if layer_name not in completed_groups_by_layer:
-                completed_groups_by_layer[layer_name] = []
-            completed_groups_by_layer[layer_name].append(group_idx)
-
-        for layer_name in data_input.layers:
-            cur_completed_groups = completed_groups_by_layer[layer_name]
-            for group_idx in sorted(cur_completed_groups):
-                layer_options.append((layer_name, group_idx))
+            if layer_name not in wanted_layers:
+                continue
+            layer_options.append((layer_name, group_idx))
     else:
         for option in data_input.layers:
             layer_name, group_idx = get_layer_and_group_from_dir_name(option)
@@ -562,9 +328,9 @@ def read_data_input(
                 continue
             layer_options.append((layer_name, group_idx))
 
-    # Now determine which item groups we should actually read.
-    # We randomly pick one, unless load_all_layers is set, in which case we read all
-    # available options.
+    # Now determine the layers that we should actually read.
+    # We randomly pick one, unless load_all_layers is set, in which case we read all of
+    # them.
     layers_to_read: list[tuple[str, int]]
     if data_input.load_all_layers:
         # We assume that the user has ensured the layers are compatible, e.g. raster
@@ -573,69 +339,16 @@ def read_data_input(
     else:
         layers_to_read = [rng.choice(layer_options)]
 
-    if not layers_to_read:
-        raise ValueError(
-            f"No completed layers found for data input with layers={data_input.layers}. "
-            f"Available layer options: {layer_options}. "
-            f"load_all_layers={data_input.load_all_layers}, "
-            f"load_all_item_groups={data_input.load_all_item_groups}. "
-            f"Check that the specified layers exist and are completed in the window."
-        )
-
     if data_input.data_type == "raster":
-        layer_datas = window.load_layer_datas()
-        images: list[torch.Tensor] = []  # each is CTHW
-        expected_timestamps: list[tuple[datetime, datetime]] | None = None
-        all_timestamps: list[tuple[datetime, datetime]] = []
-        has_all_timestamps = True
+        images: list[torch.Tensor] = []
         for layer_name, group_idx in layers_to_read:
             layer_config = dataset.layers[layer_name]
-            image, timestamps = read_raster_layer_for_data_input(
-                window,
-                bounds,
-                layer_name,
-                group_idx,
-                layer_config,
-                data_input,
-            )
-            images.append(image)
-
-            # Compute expected_timestamps from the first layer's config
-            # (assuming all layers in the same DataInput have same temporal config)
-            if expected_timestamps is None:
-                expected_timestamps = compute_expected_timestamps(window, layer_config)
-
-            if timestamps is not None:
-                all_timestamps.extend(timestamps)
-            elif image.shape[1] == 1:
-                # For single-timestep RasterImage, fallback to item-level time range
-                # for this item group.
-                layer_data = layer_datas.get(layer_name)
-                time_range = read_layer_time_range(layer_data, group_idx)
-                if time_range is not None:
-                    all_timestamps.append(time_range)
-                    warnings.warn(
-                        "Falling back to item-level time range for single-timestep "
-                        "RasterImage is deprecated and will be removed after "
-                        "2026-05-01. Ensure timestamps are stored with the raster data.",
-                        FutureWarning,
-                        stacklevel=2,
-                    )
-                else:
-                    # It is okay for single-timestep RasterImage to not have timestamps.
-                    has_all_timestamps = False
-            else:
-                # Multi-timestep RasterImage must have timestamps.
-                raise ValueError(
-                    f"Expected multi-timestep RasterImage with T={image.shape[1]} to have timestamps"
+            images.append(
+                read_raster_layer_for_data_input(
+                    window, bounds, layer_name, group_idx, layer_config, data_input
                 )
-
-        stacked = torch.cat(images, dim=1)
-        return RasterImage(
-            stacked,
-            all_timestamps if has_all_timestamps else None,
-            expected_timestamps=expected_timestamps,
-        )
+            )
+        return torch.cat(images, dim=0)
 
     elif data_input.data_type == "vector":
         # We don't really support time series for vector data currently, we just
@@ -668,15 +381,10 @@ class SplitConfig:
         num_patches: int | None = None,
         transforms: list[torch.nn.Module] | None = None,
         sampler: SamplerFactory | None = None,
-        crop_size: int | tuple[int, int] | None = None,
-        overlap_pixels: int | None = None,
-        load_all_crops: bool | None = None,
-        skip_targets: bool | None = None,
-        output_layer_name_skip_inference_if_exists: str | None = None,
-        # Deprecated parameters (for backwards compatibility)
         patch_size: int | tuple[int, int] | None = None,
         overlap_ratio: float | None = None,
         load_all_patches: bool | None = None,
+        skip_targets: bool | None = None,
     ) -> None:
         """Initialize a new SplitConfig.
 
@@ -691,21 +399,14 @@ class SplitConfig:
             num_patches: limit this split to this many patches
             transforms: transforms to apply
             sampler: SamplerFactory for this split
-            crop_size: an optional square size or (width, height) tuple. If set, read
+            patch_size: an optional square size or (width, height) tuple. If set, read
                 crops of this size rather than entire windows.
-            overlap_pixels: the number of pixels shared between adjacent crops during
-                sliding window inference.
-            load_all_crops: with crop_size set, rather than sampling a random crop
-                for each window, read all crops as separate sequential items in the
+            overlap_ratio: an optional float between 0 and 1. If set, read patches with
+                this ratio of overlap.
+            load_all_patches: with patch_size set, rather than sampling a random patch
+                for each window, read all patches as separate sequential items in the
                 dataset.
             skip_targets: whether to skip targets when loading inputs
-            output_layer_name_skip_inference_if_exists: optional name of the output layer used during prediction.
-                If set, windows that already
-                have this layer completed will be skipped (useful for resuming
-                partial inference runs).
-            patch_size: deprecated, use crop_size instead
-            overlap_ratio: deprecated, use overlap_pixels instead
-            load_all_patches: deprecated, use load_all_crops instead
         """
         self.groups = groups
         self.names = names
@@ -714,27 +415,19 @@ class SplitConfig:
         self.num_patches = num_patches
         self.transforms = transforms
         self.sampler = sampler
+        self.patch_size = patch_size
         self.skip_targets = skip_targets
-        self.output_layer_name_skip_inference_if_exists = (
-            output_layer_name_skip_inference_if_exists
-        )
 
-        # These have deprecated equivalents -- we store both raw values since we don't
-        # have a complete picture until the final merged SplitConfig is computed. We
-        # raise deprecation warnings in merge_and_validate and we disambiguate them in
-        # get_ functions (so the variables should never be accessed directly).
-        self._crop_size = crop_size
-        self._patch_size = patch_size
-        self._overlap_pixels = overlap_pixels
-        self._overlap_ratio = overlap_ratio
-        self._load_all_crops = load_all_crops
-        self._load_all_patches = load_all_patches
+        # Note that load_all_patches are handled by the RslearnDataModule rather than
+        # the ModelDataset.
+        self.load_all_patches = load_all_patches
+        self.overlap_ratio = overlap_ratio
 
-    def _merge(self, other: "SplitConfig") -> "SplitConfig":
-        """Merge settings from another SplitConfig into this one.
+        if self.overlap_ratio is not None and not (0 < self.overlap_ratio < 1):
+            raise ValueError("overlap_ratio must be between 0 and 1 (exclusive)")
 
-        Args:
-            other: the config to merge in (its non-None values override self's)
+    def update(self, other: "SplitConfig") -> "SplitConfig":
+        """Override settings in this SplitConfig with those in another.
 
         Returns:
             the resulting SplitConfig combining the settings.
@@ -747,14 +440,10 @@ class SplitConfig:
             num_patches=self.num_patches,
             transforms=self.transforms,
             sampler=self.sampler,
-            crop_size=self._crop_size,
-            patch_size=self._patch_size,
-            overlap_pixels=self._overlap_pixels,
-            overlap_ratio=self._overlap_ratio,
-            load_all_crops=self._load_all_crops,
-            load_all_patches=self._load_all_patches,
+            patch_size=self.patch_size,
+            overlap_ratio=self.overlap_ratio,
+            load_all_patches=self.load_all_patches,
             skip_targets=self.skip_targets,
-            output_layer_name_skip_inference_if_exists=self.output_layer_name_skip_inference_if_exists,
         )
         if other.groups:
             result.groups = other.groups
@@ -770,212 +459,76 @@ class SplitConfig:
             result.transforms = other.transforms
         if other.sampler:
             result.sampler = other.sampler
-        if other._crop_size is not None:
-            result._crop_size = other._crop_size
-        if other._patch_size is not None:
-            result._patch_size = other._patch_size
-        if other._overlap_pixels is not None:
-            result._overlap_pixels = other._overlap_pixels
-        if other._overlap_ratio is not None:
-            result._overlap_ratio = other._overlap_ratio
-        if other._load_all_crops is not None:
-            result._load_all_crops = other._load_all_crops
-        if other._load_all_patches is not None:
-            result._load_all_patches = other._load_all_patches
+        if other.patch_size:
+            result.patch_size = other.patch_size
+        if other.overlap_ratio is not None:
+            result.overlap_ratio = other.overlap_ratio
+        if other.load_all_patches is not None:
+            result.load_all_patches = other.load_all_patches
         if other.skip_targets is not None:
             result.skip_targets = other.skip_targets
-        if other.output_layer_name_skip_inference_if_exists is not None:
-            result.output_layer_name_skip_inference_if_exists = (
-                other.output_layer_name_skip_inference_if_exists
-            )
         return result
 
-    @staticmethod
-    def merge_and_validate(configs: list["SplitConfig"]) -> "SplitConfig":
-        """Merge a list of SplitConfigs and validate the result.
-
-        Args:
-            configs: list of SplitConfig to merge. Later configs override earlier ones.
-
-        Returns:
-            the merged and validated SplitConfig.
-        """
-        if not configs:
-            return SplitConfig()
-
-        result = configs[0]
-        for config in configs[1:]:
-            result = result._merge(config)
-
-        # Emit deprecation warnings
-        if result._patch_size is not None:
-            warnings.warn(
-                "patch_size is deprecated, use crop_size instead",
-                FutureWarning,
-                stacklevel=2,
-            )
-        if result._overlap_ratio is not None:
-            warnings.warn(
-                "overlap_ratio is deprecated, use overlap_pixels instead",
-                FutureWarning,
-                stacklevel=2,
-            )
-        if result._load_all_patches is not None:
-            warnings.warn(
-                "load_all_patches is deprecated, use load_all_crops instead",
-                FutureWarning,
-                stacklevel=2,
-            )
-
-        # Check for conflicting parameters
-        if result._crop_size is not None and result._patch_size is not None:
-            raise ValueError("Cannot specify both crop_size and patch_size")
-        if result._overlap_pixels is not None and result._overlap_ratio is not None:
-            raise ValueError("Cannot specify both overlap_pixels and overlap_ratio")
-        if result._load_all_crops is not None and result._load_all_patches is not None:
-            raise ValueError("Cannot specify both load_all_crops and load_all_patches")
-
-        # Validate overlap_pixels is non-negative
-        if result._overlap_pixels is not None and result._overlap_pixels < 0:
-            raise ValueError("overlap_pixels must be non-negative")
-
-        # overlap_pixels requires load_all_crops.
-        if result.get_overlap_pixels() > 0 and not result.get_load_all_crops():
-            raise ValueError(
-                "overlap_pixels requires load_all_crops to be True since (overlap is only used during sliding window inference"
-            )
-
-        return result
-
-    def get_crop_size(self) -> tuple[int, int] | None:
-        """Get crop size as tuple, handling deprecated patch_size."""
-        size = self._crop_size if self._crop_size is not None else self._patch_size
-        if size is None:
+    def get_patch_size(self) -> tuple[int, int] | None:
+        """Get patch size normalized to int tuple."""
+        if self.patch_size is None:
             return None
-        if isinstance(size, int):
-            return (size, size)
-        return size
+        if isinstance(self.patch_size, int):
+            return (self.patch_size, self.patch_size)
+        return self.patch_size
 
-    def get_overlap_pixels(self) -> int:
-        """Get the overlap pixels (default 0), handling deprecated overlap_ratio."""
-        if self._overlap_pixels is not None:
-            return self._overlap_pixels
-        if self._overlap_ratio is not None:
-            crop_size = self.get_crop_size()
-            if crop_size is None:
-                raise ValueError("overlap_ratio requires crop_size to be set")
-            return round(crop_size[0] * self._overlap_ratio)
-        return 0
+    def get_overlap_ratio(self) -> float:
+        """Get the overlap ratio (default 0)."""
+        return self.overlap_ratio if self.overlap_ratio is not None else 0.0
 
-    def get_load_all_crops(self) -> bool:
-        """Returns whether loading all crops is enabled (default False)."""
-        if self._load_all_crops is not None:
-            return self._load_all_crops
-        if self._load_all_patches is not None:
-            return self._load_all_patches
-        return False
+    def get_load_all_patches(self) -> bool:
+        """Returns whether loading all patches is enabled (default False)."""
+        return True if self.load_all_patches is True else False
 
     def get_skip_targets(self) -> bool:
         """Returns whether skip_targets is enabled (default False)."""
         return True if self.skip_targets is True else False
 
-    def get_output_layer_name_skip_inference_if_exists(self) -> str | None:
-        """Returns output layer to use for resume checks (default None)."""
-        return self.output_layer_name_skip_inference_if_exists
 
-
-def is_data_input_available(data_input: DataInput, window: Window) -> bool:
-    """Check if a data input's required item groups are available in a window.
-
-    Args:
-        data_input: the data input to check.
-        window: the window to check against.
-
-    Returns:
-        True if the required item groups are available.
-    """
-    # If load_all_layers is enabled, we need all entries present. Otherwise, just one.
-    is_any_available = False
-    are_all_available = True
-
-    for option in data_input.layers:
-        if data_input.load_all_item_groups:
-            # In this case the option should be a layer name directly.
-            # We can check group_idx=0 to verify there is at least one item group
-            # present in this layer (since load_all_item_groups=true, the user doesn't
-            # care how many item groups are completed).
-            layer_name = option
-            group_idx = 0
-        else:
-            # In this case it specifies an item group (like raster_layer.1).
-            layer_name, group_idx = get_layer_and_group_from_dir_name(option)
-
-        if window.is_layer_completed(layer_name, group_idx=group_idx):
-            is_any_available = True
-        else:
-            are_all_available = False
-
-    if data_input.load_all_layers:
-        return are_all_available
-    else:
-        return is_any_available
-
-
-@dataclasses.dataclass
-class CheckWindowResult:
-    """Aggregated counts of why windows were skipped during check_window."""
-
-    missing_data_input_counts: dict[str, int] = dataclasses.field(default_factory=dict)
-    has_output_layer_count: int = 0
-
-    def add(self, other: "CheckWindowResult") -> None:
-        """Merge another result into this one."""
-        for key, count in other.missing_data_input_counts.items():
-            self.missing_data_input_counts[key] = (
-                self.missing_data_input_counts.get(key, 0) + count
-            )
-        self.has_output_layer_count += other.has_output_layer_count
-
-
-def check_window(
-    inputs: dict[str, DataInput],
-    window: Window,
-    output_layer_name_skip_inference_if_exists: str | None = None,
-) -> tuple[Window | None, CheckWindowResult]:
+def check_window(inputs: dict[str, DataInput], window: Window) -> Window | None:
     """Verify that the window has the required layers based on the specified inputs.
 
     Args:
         inputs: the inputs to the dataset.
         window: the window to check.
-        output_layer_name_skip_inference_if_exists: optional name of the output layer to check for existence.
 
     Returns:
-        a tuple of (window, result) where window is the window if it passes all
-        checks or None otherwise, and result records why the window was skipped.
+        the window if it has all the required inputs or None otherwise
     """
-    for key, data_input in inputs.items():
+
+    # Make sure window has all the needed layers.
+    def is_available(data_input: DataInput) -> bool:
+        # If load_all_layers is enabled, we should check that all the layers are
+        # present. Otherwise, we just need one layer.
+        is_any_layer_available = False
+        are_all_layers_available = True
+        for layer_name in data_input.layers:
+            if window.is_layer_completed(layer_name):
+                is_any_layer_available = True
+            else:
+                are_all_layers_available = False
+        if data_input.load_all_layers:
+            return are_all_layers_available
+        else:
+            return is_any_layer_available
+
+    for data_input in inputs.values():
         if not data_input.required:
             continue
-        if not is_data_input_available(data_input, window):
+        if not is_available(data_input):
             logger.debug(
-                "Skipping window %s since check for input '%s' (layers %s) failed",
+                "Skipping window %s since check for layers %s failed",
                 window.name,
-                key,
                 data_input.layers,
             )
-            return (None, CheckWindowResult(missing_data_input_counts={key: 1}))
+            return None
 
-    # Optionally skip windows that already have the specified output layer completed.
-    if output_layer_name_skip_inference_if_exists is not None:
-        if window.is_layer_completed(output_layer_name_skip_inference_if_exists):
-            logger.debug(
-                "Skipping window %s since output layer '%s' already exists",
-                window.name,
-                output_layer_name_skip_inference_if_exists,
-            )
-            return (None, CheckWindowResult(has_output_layer_count=1))
-
-    return (window, CheckWindowResult())
+    return window
 
 
 class ModelDataset(torch.utils.data.Dataset):
@@ -989,8 +542,7 @@ class ModelDataset(torch.utils.data.Dataset):
         task: Task,
         workers: int,
         name: str | None = None,
-        fix_crop_pick: bool = False,
-        index_mode: IndexMode = IndexMode.OFF,
+        fix_patch_pick: bool = False,
     ) -> None:
         """Instantiate a new ModelDataset.
 
@@ -1000,29 +552,60 @@ class ModelDataset(torch.utils.data.Dataset):
             inputs: data to read from the dataset for training
             task: the task to train on
             workers: number of workers to use for initializing the dataset
-            name: name of the dataset
-            fix_crop_pick: if True, fix the crop pick to be the same every time
+            name: name of the dataset (default: None)
+            fix_patch_pick: if True, fix the patch pick to be the same every time
                 for a given window. Useful for testing (default: False)
-            index_mode: controls dataset index caching behavior (default: IndexMode.OFF)
         """
         self.dataset = dataset
         self.split_config = split_config
         self.inputs = inputs
         self.task = task
         self.name = name
-        self.fix_crop_pick = fix_crop_pick
+        self.fix_patch_pick = fix_patch_pick
         if split_config.transforms:
             self.transforms = Sequential(*split_config.transforms)
         else:
             self.transforms = rslearn.train.transforms.transform.Identity()
 
-        # Get normalized crop size from the SplitConfig.
-        # But if load_all_crops is enabled, this is handled by AllCropsDataset, so
+        # Get normalized patch size from the SplitConfig.
+        # But if load all patches is enabled, this is handled by AllPatchesDataset, so
         # here we instead load the entire windows.
-        if split_config.get_load_all_crops():
-            self.crop_size = None
+        if split_config.get_load_all_patches():
+            self.patch_size = None
         else:
-            self.crop_size = split_config.get_crop_size()
+            self.patch_size = split_config.get_patch_size()
+
+        if split_config.names:
+            windows = self.dataset.load_windows(
+                groups=split_config.groups,
+                names=split_config.names,
+                show_progress=True,
+                workers=workers,
+            )
+        elif split_config.groups:
+            windows = self.dataset.load_windows(
+                groups=split_config.groups, show_progress=True, workers=workers
+            )
+        else:
+            windows = self.dataset.load_windows(show_progress=True, workers=workers)
+
+        if split_config.tags:
+            # Filter the window.options.
+            new_windows = []
+            num_removed: dict[str, int] = {}
+            for window in windows:
+                for k, v in split_config.tags.items():
+                    if k not in window.options or (v and window.options[k] != v):
+                        num_removed[k] = num_removed.get(k, 0) + 1
+                        break
+                else:
+                    new_windows.append(window)
+            logger.info(
+                f"Started with {len(windows)} windows, ended with {len(new_windows)} windows for {self.dataset.path}"
+            )
+            for k, v in num_removed.items():
+                logger.info(f"Removed {v} windows due to tag {k}")
+            windows = new_windows
 
         # If targets are not needed, remove them from the inputs.
         if split_config.get_skip_targets():
@@ -1030,8 +613,56 @@ class ModelDataset(torch.utils.data.Dataset):
                 if self.inputs[k].is_target:
                     del self.inputs[k]
 
-        # Load windows (from index if available, otherwise from dataset)
-        windows = self._load_windows(split_config, workers, index_mode)
+        # Eliminate windows that are missing either a requisite input layer, or missing
+        # all target layers.
+        # We use only main thread if the index is set, since that can take a long time
+        # to send to the worker threads, it may get serialized for each window.
+        new_windows = []
+        if workers == 0 or (len(windows) >= 1 and windows[0].index is not None):
+            for window in windows:
+                if check_window(self.inputs, window) is None:
+                    continue
+                # The index may be set, but now that this check is done, from here on
+                # we no longer need it. We set it None so that we don't end up passing
+                # it later to the dataloader workers.
+                window.index = None
+                new_windows.append(window)
+        else:
+            p = multiprocessing.Pool(workers)
+            outputs = star_imap_unordered(
+                p,
+                check_window,
+                [
+                    dict(
+                        inputs=self.inputs,
+                        window=window,
+                    )
+                    for window in windows
+                ],
+            )
+            for window in tqdm.tqdm(
+                outputs, total=len(windows), desc="Checking available layers in windows"
+            ):
+                if window is None:
+                    continue
+                new_windows.append(window)
+            p.close()
+        windows = new_windows
+
+        # Sort the windows to ensure that the dataset is consistent across GPUs.
+        # Inconsistent ordering can lead to a subset of windows being processed during
+        # "model test" / "model predict" when using multiple GPUs.
+        # We use a hash so that functionality like num_samples limit gets a random
+        # subset of windows (with respect to the hash function choice).
+        windows.sort(
+            key=lambda window: hashlib.sha256(window.name.encode()).hexdigest()
+        )
+
+        # Limit windows to num_samples if requested.
+        if split_config.num_samples:
+            # The windows are sorted by hash of window name so this distribution should
+            # be representative of the population.
+            windows = windows[0 : split_config.num_samples]
 
         # Write dataset_examples to a file so that we can load it lazily in the worker
         # processes. Otherwise it takes a long time to transmit it when spawning each
@@ -1050,200 +681,20 @@ class ModelDataset(torch.utils.data.Dataset):
         with open(self.dataset_examples_fname, "w") as f:
             json.dump([self._serialize_item(example) for example in windows], f)
 
-    def _get_initial_windows(
-        self, split_config: SplitConfig, workers: int
-    ) -> list[Window]:
-        """Get the initial windows before input layer filtering.
-
-        The windows are filtered based on configured window names, groups, and tags.
-
-        This is a helper for the init function.
-
-        Args:
-            split_config: the split configuration.
-            workers: number of worker processes.
-
-        Returns:
-            list of windows from the dataset after applying the aforementioned filters.
-        """
-        # Load windows from dataset.
-        # If the window storage is FileWindowStorage, we pass the workers/show_progress arguments.
-        kwargs: dict[str, Any] = {}
-        if isinstance(self.dataset.storage, FileWindowStorage):
-            kwargs["workers"] = workers
-            kwargs["show_progress"] = True
-        # We also add the name/group filters to the kwargs.
-        if split_config.names:
-            kwargs["names"] = split_config.names
-        if split_config.groups:
-            kwargs["groups"] = split_config.groups
-
-        windows = self.dataset.load_windows(**kwargs)
-
-        # Filter by tags (if provided) using the window.options.
-        if split_config.tags:
-            new_windows = []
-            num_removed: dict[str, int] = {}
-            for window in windows:
-                for k, v in split_config.tags.items():
-                    if k not in window.options or (v and window.options[k] != v):
-                        num_removed[k] = num_removed.get(k, 0) + 1
-                        break
-                else:
-                    new_windows.append(window)
-            logger.info(
-                f"Started with {len(windows)} windows, ended with {len(new_windows)} windows for {self.dataset.path}"
-            )
-            for k, v in num_removed.items():
-                logger.info(f"Removed {v} windows due to tag {k}")
-            windows = new_windows
-
-        return windows
-
-    def _load_windows(
-        self,
-        split_config: SplitConfig,
-        workers: int,
-        index_mode: IndexMode,
-    ) -> list[Window]:
-        """Load windows, using index if available.
-
-        This method handles:
-        1. Loading from index if index_mode is USE and index exists
-        2. Otherwise, loading from dataset, filtering, sorting, limiting
-        3. Saving to index if index_mode is USE or REFRESH
-
-        Args:
-            split_config: the split configuration.
-            workers: number of worker processes.
-            index_mode: controls caching behavior.
-
-        Returns:
-            list of processed windows ready for training.
-        """
-        # Try to load from index
-        index: DatasetIndex | None = None
-
-        if index_mode != IndexMode.OFF:
-            logger.info(f"Checking index for dataset {self.dataset.path}")
-            index = DatasetIndex(
-                storage=self.dataset.storage,
-                dataset_path=self.dataset.path,
-                groups=split_config.groups,
-                names=split_config.names,
-                tags=split_config.tags,
-                num_samples=split_config.num_samples,
-                skip_targets=split_config.get_skip_targets(),
-                inputs=self.inputs,
-            )
-            refresh = index_mode == IndexMode.REFRESH
-            indexed_windows = index.load_windows(refresh)
-
-            if indexed_windows is not None:
-                logger.info(f"Loaded {len(indexed_windows)} windows from index")
-                return indexed_windows
-
-        # No index available, load and process windows from dataset
-        logger.debug("Loading windows from dataset...")
-        windows = self._get_initial_windows(split_config, workers)
-        windows = self._filter_windows_by_layers(windows, workers)
-        windows = self._sort_and_limit_windows(windows, split_config)
-
-        # Save to index if enabled
-        if index is not None:
-            index.save_windows(windows)
-
-        return windows
-
-    def _filter_windows_by_layers(
-        self, windows: list[Window], workers: int
-    ) -> list[Window]:
-        """Filter windows to only include those with required layers.
-
-        Args:
-            windows: list of windows to filter.
-            workers: number of worker processes for parallel filtering.
-
-        Returns:
-            list of windows that have all required input layers.
-        """
-        output_layer_skip = (
-            self.split_config.get_output_layer_name_skip_inference_if_exists()
-        )
-
-        result = CheckWindowResult()
-        filtered = []
-
-        with make_pool_and_star_imap_unordered(
-            workers,
-            check_window,
-            [
-                dict(
-                    inputs=self.inputs,
-                    window=window,
-                    output_layer_name_skip_inference_if_exists=output_layer_skip,
-                )
-                for window in windows
-            ],
-        ) as outputs:
-            for window, check_result in tqdm.tqdm(
-                outputs,
-                total=len(windows),
-                desc="Checking available layers in windows",
-            ):
-                result.add(check_result)
-                if window is not None:
-                    filtered.append(window)
-
-        if result.missing_data_input_counts:
-            for key, count in sorted(result.missing_data_input_counts.items()):
-                logger.info("Skipped %d windows due to missing input '%s'", count, key)
-        if result.has_output_layer_count > 0:
-            logger.info(
-                "Skipped %d windows due to existing output layer",
-                result.has_output_layer_count,
-            )
-
-        return filtered
-
-    def _sort_and_limit_windows(
-        self, windows: list[Window], split_config: SplitConfig
-    ) -> list[Window]:
-        """Sort windows by hash and apply num_samples limit.
-
-        Sorting ensures consistent ordering across GPUs. Using hash gives a
-        pseudo-random but deterministic order for sampling.
-
-        Args:
-            windows: list of windows to sort and limit.
-            split_config: the split configuration with num_samples.
-
-        Returns:
-            sorted and optionally limited list of windows.
-        """
-        windows.sort(
-            key=lambda window: hashlib.sha256(window.name.encode()).hexdigest()
-        )
-
-        if split_config.num_samples:
-            windows = windows[: split_config.num_samples]
-
-        return windows
-
     def _serialize_item(self, example: Window) -> dict[str, Any]:
         return example.get_metadata()
 
     def _deserialize_item(self, d: dict[str, Any]) -> Window:
         return Window.from_metadata(
-            self.dataset.storage,
+            Window.get_window_root(self.dataset.path, d["group"], d["name"]),
             d,
         )
 
     def get_dataset_examples(self) -> list[Window]:
         """Get a list of examples in the dataset.
 
-        If load_all_crops is False, this is a list of Windows. Otherwise, this is a
-        list of (window, crop_bounds, (crop_idx, # crops)) tuples.
+        If load_all_patches is False, this is a list of Windows. Otherwise, this is a
+        list of (window, patch_bounds, (patch_idx, # patches)) tuples.
         """
         if self.dataset_examples is None:
             logger.debug(
@@ -1262,11 +713,11 @@ class ModelDataset(torch.utils.data.Dataset):
 
     def get_raw_inputs(
         self, idx: int
-    ) -> tuple[dict[str, Any], dict[str, Any], SampleMetadata]:
+    ) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any]]:
         """Get the raw inputs and base metadata for this example.
 
         This is the raster or vector data before being processed by the Task. So it
-        should be a RasterImage for raster and list[Feature] for vector.
+        should be a Tensor for raster and list[Feature] for vector.
 
         Args:
             idx: the index in the dataset.
@@ -1276,37 +727,37 @@ class ModelDataset(torch.utils.data.Dataset):
         """
         dataset_examples = self.get_dataset_examples()
         example = dataset_examples[idx]
-        rng = random.Random(idx if self.fix_crop_pick else None)
+        rng = random.Random(idx if self.fix_patch_pick else None)
 
         # Select bounds to read.
-        if self.crop_size:
+        if self.patch_size:
             window = example
 
-            def get_crop_range(n_crop: int, n_window: int) -> list[int]:
-                if n_crop > n_window:
+            def get_patch_range(n_patch: int, n_window: int) -> list[int]:
+                if n_patch > n_window:
                     # Select arbitrary range containing the entire window.
-                    # Basically arbitrarily padding the window to get to crop size.
-                    start = rng.randint(n_window - n_crop, 0)
-                    return [start, start + n_crop]
+                    # Basically arbitrarily padding the window to get to patch size.
+                    start = rng.randint(n_window - n_patch, 0)
+                    return [start, start + n_patch]
 
                 else:
-                    # Select arbitrary crop within the window.
-                    start = rng.randint(0, n_window - n_crop)
-                    return [start, start + n_crop]
+                    # Select arbitrary patch within the window.
+                    start = rng.randint(0, n_window - n_patch)
+                    return [start, start + n_patch]
 
             window_size = (
                 window.bounds[2] - window.bounds[0],
                 window.bounds[3] - window.bounds[1],
             )
-            crop_ranges = [
-                get_crop_range(self.crop_size[0], window_size[0]),
-                get_crop_range(self.crop_size[1], window_size[1]),
+            patch_ranges = [
+                get_patch_range(self.patch_size[0], window_size[0]),
+                get_patch_range(self.patch_size[1], window_size[1]),
             ]
             bounds = (
-                window.bounds[0] + crop_ranges[0][0],
-                window.bounds[1] + crop_ranges[1][0],
-                window.bounds[0] + crop_ranges[0][1],
-                window.bounds[1] + crop_ranges[1][1],
+                window.bounds[0] + patch_ranges[0][0],
+                window.bounds[1] + patch_ranges[1][0],
+                window.bounds[0] + patch_ranges[0][1],
+                window.bounds[1] + patch_ranges[1][1],
             )
 
         else:
@@ -1318,40 +769,27 @@ class ModelDataset(torch.utils.data.Dataset):
         raw_inputs = {}
         passthrough_inputs = {}
         for name, data_input in self.inputs.items():
-            # Skip non-required inputs if their layers are not available
-            if not data_input.required and not is_data_input_available(
-                data_input, window
-            ):
-                logger.debug(
-                    "Skipping non-required input '%s' for window %s (layers not available)",
-                    name,
-                    window.name,
-                )
-                continue
-
             raw_inputs[name] = read_data_input(
                 self.dataset, window, bounds, data_input, rng
             )
             if data_input.passthrough:
                 passthrough_inputs[name] = raw_inputs[name]
 
-        metadata = SampleMetadata(
-            window_group=window.group,
-            window_name=window.name,
-            window_bounds=window.bounds,
-            crop_bounds=bounds,
-            crop_idx=0,
-            num_crops_in_window=1,
-            time_range=window.time_range,
-            projection=window.projection,
-            dataset_source=self.name,
-        )
+        metadata = {
+            "group": window.group,
+            "window_name": window.name,
+            "window_bounds": window.bounds,
+            "bounds": bounds,
+            "time_range": window.time_range,
+            "projection": window.projection,
+            "dataset_source": self.name,
+        }
 
         return raw_inputs, passthrough_inputs, metadata
 
     def __getitem__(
         self, idx: int
-    ) -> tuple[dict[str, Any], dict[str, Any], SampleMetadata]:
+    ) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any]]:
         """Read one training example.
 
         Args:
@@ -1363,6 +801,8 @@ class ModelDataset(torch.utils.data.Dataset):
         logger.debug("__getitem__ start pid=%d item_idx=%d", os.getpid(), idx)
 
         raw_inputs, passthrough_inputs, metadata = self.get_raw_inputs(idx)
+        metadata["patch_idx"] = 0
+        metadata["num_patches"] = 1
 
         input_dict, target_dict = self.task.process_inputs(
             raw_inputs,
@@ -1371,6 +811,7 @@ class ModelDataset(torch.utils.data.Dataset):
         )
         input_dict.update(passthrough_inputs)
         input_dict, target_dict = self.transforms(input_dict, target_dict)
+        input_dict["dataset_source"] = self.name
 
         logger.debug("__getitem__ finish pid=%d item_idx=%d", os.getpid(), idx)
 

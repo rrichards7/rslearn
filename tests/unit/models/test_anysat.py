@@ -1,7 +1,6 @@
 """Test the AnySat model."""
 
 import pathlib
-from datetime import datetime
 from typing import Any
 
 import huggingface_hub.constants
@@ -9,7 +8,6 @@ import pytest
 import torch
 
 from rslearn.models.anysat import AnySat
-from rslearn.train.model_context import ModelContext, RasterImage
 
 
 @pytest.mark.slow
@@ -21,17 +19,8 @@ def test_anysat_various_modalities(tmp_path: pathlib.Path, monkeypatch: Any) -> 
         # 1. Single s2 (dense)
         {
             "modalities": ["s2"],
-            "inputs": [
-                {
-                    "s2": RasterImage(
-                        torch.zeros((10, 3, 16, 16)),
-                        timestamps=[
-                            (datetime(2025, x, 1), datetime(2025, x, 1))
-                            for x in range(1, 3 + 1)
-                        ],
-                    )
-                }
-            ],
+            "dates": {"s2": list(range(3))},
+            "inputs": [{"s2": torch.zeros((3 * 10, 16, 16))}],
             "patch_size": 20,
             "expected_shape": (1, 1536, 16, 16),
             "mode": "dense",
@@ -40,22 +29,11 @@ def test_anysat_various_modalities(tmp_path: pathlib.Path, monkeypatch: Any) -> 
         # 2. Multimodal: s1-asc + s2 (patch)
         {
             "modalities": ["s1-asc", "s2"],
+            "dates": {"s1-asc": list(range(4)), "s2": list(range(3))},
             "inputs": [
                 {
-                    "s1-asc": RasterImage(
-                        torch.zeros((2, 4, 16, 16)),
-                        timestamps=[
-                            (datetime(2025, x, 1), datetime(2025, x, 1))
-                            for x in range(1, 4 + 1)
-                        ],
-                    ),
-                    "s2": RasterImage(
-                        torch.zeros((10, 3, 16, 16)),
-                        timestamps=[
-                            (datetime(2025, x, 1), datetime(2025, x, 1))
-                            for x in range(1, 3 + 1)
-                        ],
-                    ),
+                    "s1-asc": torch.zeros((4 * 2, 16, 16)),
+                    "s2": torch.zeros((3 * 10, 16, 16)),
                 }
             ],
             "patch_size": 20,
@@ -66,17 +44,8 @@ def test_anysat_various_modalities(tmp_path: pathlib.Path, monkeypatch: Any) -> 
         # 3. Landsat 8 (patch)
         {
             "modalities": ["l8"],
-            "inputs": [
-                {
-                    "l8": RasterImage(
-                        torch.zeros((11, 3, 16, 16)),
-                        timestamps=[
-                            (datetime(2025, x, 1), datetime(2025, x, 1))
-                            for x in range(1, 3 + 1)
-                        ],
-                    )
-                }
-            ],
+            "dates": {"l8": list(range(3))},
+            "inputs": [{"l8": torch.zeros((3 * 11, 16, 16))}],
             "patch_size": 20,
             "expected_shape": (1, 768, 8, 8),
             "mode": "patch",
@@ -88,15 +57,12 @@ def test_anysat_various_modalities(tmp_path: pathlib.Path, monkeypatch: Any) -> 
         model = AnySat(
             modalities=scenario["modalities"],
             patch_size_meters=scenario["patch_size"],
+            dates=scenario["dates"],
             output=scenario["mode"],
             output_modality=scenario["output_modality"],
         )
         # Only one feature map returned
-        context = ModelContext(
-            inputs=scenario["inputs"],
-            metadatas=[],
-        )
-        features = model.forward(context).feature_maps[0]
+        features = model.forward(scenario["inputs"])[0]
 
         assert features.shape == scenario["expected_shape"]  # type: ignore
 

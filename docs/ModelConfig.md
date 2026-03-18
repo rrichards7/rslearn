@@ -311,10 +311,6 @@ Here is an example for a simple single-task training setup that inputs one modal
         # The bands to read. These should correspond to band names in the dataset
         # config.json for each of the layers above.
         bands: ["B04", "B03", "B02", "B05", "B06", "B07", "B08", "B11", "B12"]
-        # Alternatively, omit `bands` and set
-        # `use_all_bands_in_order_of_band_set_idx` to a band_set index to
-        # automatically use all bands from that band_set in dataset-config order.
-        use_all_bands_in_order_of_band_set_idx: 0
         # If true, examples not containing the layers needed to read this input are
         # skipped. This should generally be left enabled (default).
         required: true
@@ -349,9 +345,8 @@ Here is an example for a simple single-task training setup that inputs one modal
         load_all_item_groups: false
 ```
 
-For raster data, `dtype` is required. `bands` is required unless you set
-`use_all_bands_in_order_of_band_set_idx` to use all band names from the selected
-band set in the dataset layer config. For vector data, omit `bands` and `dtype`.
+For raster data, the `bands` and `dtype` options are required, but they should be
+omitted for vector data.
 
 Time series in rslearn are represented as (T*C, H, W) tensors, where the timesteps (T)
 are concatenated on the channel dimension (C), and the other two dimensions are
@@ -367,7 +362,7 @@ If `layers` explicitly specifies all three item groups (set to
 `load_all_item_groups` are both false, then for each `__getitem__` call, rslearn will
 pick a random layer from the list, and only load that one image.
 
-If `layers` is set to `["sentinel2"]`, and `load_all_item_groups` is set, then it is
+If `layers` is set to `["sentinel2"]`", and `load_all_item_groups` is set, then it is
 equivalent to above: the layer will be expanded into its item groups, and one item
 group will be randomly picked.
 
@@ -385,7 +380,7 @@ contain all three item groups will be used for training.
 
 ### task
 
-This configures the Task object. See `rslearn.train.tasks` for more details.
+This configures the Task object See `rslearn.train.tasks` for more details.
 
 The Task object defines a supervised remote sensing task. Currently implemented tasks
 in rslearn include:
@@ -491,8 +486,7 @@ Here is an example of its usage.
               # Compute metric as the L1 (absolute error) between the predicted values
               # and the labels. Note that while the loss operates over the scaled
               # values, the metric operates over the unscaled values.
-              # (metric_mode is deprecated; use metrics.)
-              metrics: ["l1"]
+              metric_mode: "l1"
           segment:
             class_path: rslearn.train.tasks.segmentation.SegmentationTask
             init_args:
@@ -504,9 +498,9 @@ Here is an example of its usage.
           # the "targets" key. The tasks will process these into a form suitable for
           # training.
           regress:
-            # The key here must match the name of the input under the inputs section.
+            # The key here must match the name of the input under the inpust section.
             regress_input: "targets"
-            segment_input: "targets"
+            segment_input: "targets
 ```
 
 ### num_workers and init_workers
@@ -571,15 +565,11 @@ Here is a summary of all of the options available in the SplitConfig.
       # For validation, testing, and prediction, patch_size can be combined with
       # load_all_crops to perform sliding window inference. For training, it should
       # usually be left false so that each training epoch sees a different crop.
-      load_all_crops: false
+      load_all_patches: false
       # This should typically be enabled for predict_config, so that windows without
       # layers containing targets are skipped. For training, validation, and testing,
       # targets are needed so it should be false.
       skip_targets: false
-      # Resume partial inference: if set, windows that already have this layer
-      # completed will be skipped by default, so predict can resume without
-      # reprocessing completed windows.
-      output_layer_name_skip_inference_if_exists: null
 ```
 
 The transforms will adjust the initial input and target dicts that come from reading
@@ -605,7 +595,7 @@ model:
       class_path: rslearn.models.singletask.SingleTaskModel
       init_args:
         encoder:
-          - class_path: rslearn.models.olmoearth_pretrain.model.OlmoEarth
+          - class_path: rslp.olmoearth_pretrain.model.OlmoEarth
             init_args:
               forward_kwargs:
                 patch_size: 4
@@ -687,6 +677,9 @@ trainer:
     # It is only active during the predict stage.
     - class_path: rslearn.train.prediction_writer.RslearnWriter
       init_args:
+        # This can be left as a placehloder -- rslearn will override it with the
+        # rslearn dataset path from data.init_args.path.
+        path: placeholder
         # This is the name of the layer in the rslearn dataset under which the
         # predictions should be saved. It must exist in the dataset config.
         output_layer: output
@@ -695,6 +688,15 @@ trainer:
         # generally be omitted. When using MultiTaskModel, this option should usually
         # match with the sub-task name.
         selector: ["detect"]
+    # The ModelCheckpoint callback saves model checkpoints.
+    - class_path: lightning.pytorch.callbacks.ModelCheckpoint
+      init_args:
+        # We keep the checkpoint that has the maximum mAP value on the detect task.
+        save_top_k: 1
+        monitor: val_detect/mAP
+        mode: max
+        # We also keep the latest checkpoint.
+        save_last: true
 ```
 
 ## Model Management Options
@@ -704,18 +706,13 @@ it, when running `model test` and `model predict`, the checkpoint needs to be
 explicitly specified using `--ckpt_path`.
 
 If enabled, model management will:
-1. Set `trainer.default_root_dir` to `{management_dir}/{project_name}/{run_name}/`.
-   This is used by `ManagedBestLastCheckpoint` to resolve its checkpoint directory.
+1. Adjust the `dirpath` of any `ModelCheckpoint` callbacks to save checkpoints in
+   a project directory at `{management_dir}/{project_name}/{run_name}/`.
 2. If training is restarted, resume from the last checkpoint.
 3. During test/predict, automatically load the best checkpoint.
 4. Enable W&B logging and save the W&B run ID to the save project directory (so it can
    be reused when resuming training).
 5. Save the model config with the W&B run.
-
-To save checkpoints, add a `ManagedBestLastCheckpoint` callback to `trainer.callbacks`.
-This callback automatically determines its checkpoint directory from
-`trainer.default_root_dir` (set by model management), and saves both `last.ckpt` and
-`best.ckpt` based on the monitored metric.
 
 Common options are summarized below:
 
@@ -745,14 +742,6 @@ load_checkpoint_required: auto
 # 'no' will disable logging.
 # 'auto' will use 'yes' during fit and 'no' during val/test/predict.
 log_mode: auto
-trainer:
-  callbacks:
-    # Saves last.ckpt every validation epoch and best.ckpt when the metric improves.
-    # dirpath is automatically set from management_dir/project_name/run_name.
-    - class_path: rslearn.train.callbacks.checkpointing.ManagedBestLastCheckpoint
-      init_args:
-        monitor: val_loss
-        mode: min
 ```
 
 ## Using Custom Classes
@@ -770,7 +759,7 @@ from torch.optim import Optimizer
 
 @dataclass
 class Adadelta(OptimizerFactory):
-    """Factory for Adadelta optimizer."""
+    """Factory for Adadelta optimzier."""
 
     lr: float = 0.001
     rho: float | None = None
@@ -788,7 +777,7 @@ class Adadelta(OptimizerFactory):
 Suppose this is in `your_pkg.optimizer`. Then, you can configure it as follows:
 
 ```yaml
-model:
+model
   class_path: rslearn.train.lightning_module.RslearnLightningModule
   init_args:
     # ...

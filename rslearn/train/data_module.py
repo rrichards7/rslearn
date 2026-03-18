@@ -15,13 +15,12 @@ from rslearn.dataset import Dataset
 from rslearn.log_utils import get_logger
 from rslearn.train.tasks import Task
 
-from .all_crops_dataset import (
-    InMemoryAllCropsDataset,
-    IterableAllCropsDataset,
+from .all_patches_dataset import (
+    InMemoryAllPatchesDataset,
+    IterableAllPatchesDataset,
 )
 from .dataset import (
     DataInput,
-    IndexMode,
     ModelDataset,
     MultiDataset,
     RetryDataset,
@@ -69,8 +68,7 @@ class RslearnDataModule(L.LightningDataModule):
         predict_config: SplitConfig = SplitConfig(),
         name: str | None = None,
         retries: int = 0,
-        use_in_memory_all_crops_dataset: bool = False,
-        index_mode: IndexMode = IndexMode.OFF,
+        use_in_memory_all_patches_dataset: bool = False,
     ) -> None:
         """Initialize a new RslearnDataModule.
 
@@ -92,9 +90,8 @@ class RslearnDataModule(L.LightningDataModule):
             predict_config: split config for predict split
             name: name of the dataset
             retries: number of retries to attempt for getitem calls
-            use_in_memory_all_crops_dataset: whether to use InMemoryAllCropsDataset
-                instead of IterableAllCropsDataset if load_all_crops is set to true.
-            index_mode: controls dataset index caching behavior (default: IndexMode.OFF)
+            use_in_memory_all_patches_dataset: whether to use InMemoryAllPatchesDataset
+                instead of IterableAllPatchesDataset if load_all_patches is set to true.
         """
         super().__init__()
         self.inputs = inputs
@@ -105,25 +102,24 @@ class RslearnDataModule(L.LightningDataModule):
         self.init_workers = init_workers if init_workers > 0 else self.num_workers
         self.name = name
         self.retries = retries
-        self.use_in_memory_all_crops_dataset = use_in_memory_all_crops_dataset
-        self.index_mode = index_mode
+        self.use_in_memory_all_patches_dataset = use_in_memory_all_patches_dataset
         self.split_configs = {
-            "train": SplitConfig.merge_and_validate([default_config, train_config]),
-            "val": SplitConfig.merge_and_validate([default_config, val_config]),
-            "test": SplitConfig.merge_and_validate([default_config, test_config]),
-            "predict": SplitConfig.merge_and_validate([default_config, predict_config]),
+            "train": default_config.update(train_config),
+            "val": default_config.update(val_config),
+            "test": default_config.update(test_config),
+            "predict": default_config.update(predict_config),
         }
 
     def setup(
-        self, stage: str, use_in_memory_all_crops_dataset: bool | None = None
+        self, stage: str, use_in_memory_all_patches_dataset: bool | None = None
     ) -> None:
         """Set up datasets and samplers.
 
         Args:
             stage: Either 'fit', 'validate', 'test', or 'predict'.
-            use_in_memory_all_crops_dataset: whether to use InMemoryAllCropsDataset
-                instead of IterableAllCropsDataset if load_all_crops is set to true.
-                If None, uses the value of self.use_in_memory_all_crops_dataset.
+            use_in_memory_all_patches_dataset: whether to use InMemoryAllPatchesDataset
+                instead of IterableAllPatchesDataset if load_all_patches is set to true.
+                If None, uses the value of self.use_in_memory_all_patches_dataset.
         """
         stage_to_splits = {
             "fit": ["train", "val"],
@@ -141,38 +137,37 @@ class RslearnDataModule(L.LightningDataModule):
                 task=self.task,
                 workers=self.init_workers,
                 name=self.name,
-                fix_crop_pick=(split != "train"),
-                index_mode=self.index_mode,
+                fix_patch_pick=(split != "train"),
             )
             logger.info(f"got {len(dataset)} examples in split {split}")
-            if split_config.get_load_all_crops():
-                if use_in_memory_all_crops_dataset is None:
-                    use_in_memory_all_crops_dataset = (
-                        self.use_in_memory_all_crops_dataset
+            if split_config.get_load_all_patches():
+                if use_in_memory_all_patches_dataset is None:
+                    use_in_memory_all_patches_dataset = (
+                        self.use_in_memory_all_patches_dataset
                     )
                 logger.info(
-                    f"using AllCropsDataset (in_memory={use_in_memory_all_crops_dataset})"
+                    f"using AllPatchesDataset (in_memory={use_in_memory_all_patches_dataset})"
                 )
-                crop_size = split_config.get_crop_size()
-                if crop_size is None:
+                patch_size = split_config.get_patch_size()
+                if patch_size is None:
                     raise ValueError(
-                        "crop_size is not set but must be set if load_all_crops is set"
+                        "patch_size is not set but must be set if load_all_patches is set"
                     )
 
-                all_crops_cls = IterableAllCropsDataset
+                all_patches_cls = IterableAllPatchesDataset
                 kwargs = dict(
                     dataset=dataset,
-                    crop_size=crop_size,
-                    overlap_pixels=split_config.get_overlap_pixels(),
+                    patch_size=patch_size,
+                    overlap_ratio=split_config.get_overlap_ratio(),
                     rank=self.trainer.global_rank if self.trainer else 0,
                     world_size=self.trainer.world_size if self.trainer else 1,
                 )
-                if use_in_memory_all_crops_dataset:
+                if use_in_memory_all_patches_dataset:
                     kwargs.pop("rank")
                     kwargs.pop("world_size")
-                    all_crops_cls = InMemoryAllCropsDataset  # type: ignore
+                    all_patches_cls = InMemoryAllPatchesDataset  # type: ignore
 
-                dataset = all_crops_cls(**kwargs)  # type: ignore
+                dataset = all_patches_cls(**kwargs)  # type: ignore
 
             if self.retries > 0:
                 dataset = RetryDataset(dataset, retries=self.retries)
@@ -203,16 +198,13 @@ class RslearnDataModule(L.LightningDataModule):
         # Enable persistent workers unless we are using main process.
         persistent_workers = self.num_workers > 0
 
-        # If using all crops, limit number of workers to the number of windows.
+        # If using all patches, limit number of workers to the number of windows.
         # Otherwise it has to distribute the same window to different workers which can
         # cause issues for RslearnWriter.
         # If the number of windows is 0, then we can set positive number of workers
         # since they won't yield anything anyway.
         num_workers = self.num_workers
-        if (
-            split_config.get_load_all_crops()
-            and len(dataset.get_dataset_examples()) > 0
-        ):
+        if split_config.load_all_patches and len(dataset.get_dataset_examples()) > 0:
             num_workers = min(num_workers, len(dataset.get_dataset_examples()))
 
         kwargs: dict[str, Any] = dict(
@@ -360,7 +352,7 @@ class MultiDatasetDataModule(L.LightningDataModule):
             stage: The stage to set up ('fit', 'validate', 'test', 'predict')
         """
         for name, data_module in self.data_modules.items():
-            data_module.setup(stage, use_in_memory_all_crops_dataset=True)  # type: ignore
+            data_module.setup(stage, use_in_memory_all_patches_dataset=True)  # type: ignore
             data_module.set_name(name)
 
     def _get_dataloader(self, split: str) -> DataLoader[dict[str, torch.Tensor]]:

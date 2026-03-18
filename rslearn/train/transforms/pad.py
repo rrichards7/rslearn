@@ -5,8 +5,6 @@ from typing import Any
 import torch
 import torchvision
 
-from rslearn.train.model_context import RasterImage
-
 from .transform import Transform
 
 
@@ -19,7 +17,6 @@ class Pad(Transform):
         mode: str = "topleft",
         image_selectors: list[str] = ["image"],
         box_selectors: list[str] = [],
-        skip_missing: bool = False,
     ):
         """Initialize a new Crop.
 
@@ -32,10 +29,8 @@ class Pad(Transform):
                 sides, or "center" to apply padding equally on all sides.
             image_selectors: image items to transform.
             box_selectors: boxes items to transform.
-            skip_missing: if True, skip selectors that don't exist in the input/target
-                dicts. Useful when working with optional inputs.
         """
-        super().__init__(skip_missing=skip_missing)
+        super().__init__()
         if isinstance(size, int):
             self.size = (size, size + 1)
         else:
@@ -53,7 +48,7 @@ class Pad(Transform):
         """
         return {"size": torch.randint(low=self.size[0], high=self.size[1], size=())}
 
-    def apply_image(self, image: RasterImage, state: dict[str, bool]) -> RasterImage:
+    def apply_image(self, image: torch.Tensor, state: dict[str, bool]) -> torch.Tensor:
         """Apply the sampled state on the specified image.
 
         Args:
@@ -106,12 +101,8 @@ class Pad(Transform):
             horizontal_pad = (horizontal_half, horizontal_extra - horizontal_half)
             vertical_pad = (vertical_half, vertical_extra - vertical_half)
 
-        image.image = apply_padding(
-            image.image, True, horizontal_pad[0], horizontal_pad[1]
-        )
-        image.image = apply_padding(
-            image.image, False, vertical_pad[0], vertical_pad[1]
-        )
+        image = apply_padding(image, True, horizontal_pad[0], horizontal_pad[1])
+        image = apply_padding(image, False, vertical_pad[0], vertical_pad[1])
         return image
 
     def apply_boxes(self, boxes: Any, state: dict[str, bool]) -> torch.Tensor:

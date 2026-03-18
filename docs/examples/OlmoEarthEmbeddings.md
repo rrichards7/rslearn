@@ -5,12 +5,14 @@ of interest. We will use rslearn to materialize satellite images that we will th
 to the OlmoEarth encoder. For an introduction to rslearn, see
 [the main README](../../README.md) and [CoreConcepts](../CoreConcepts.md).
 
-We proceed in three steps:
+We proceed in four steps:
 
-1. [Create windows](#create-windows): create an rslearn dataset and add windows that define the spatiotemporal
-   boxes for which we want to compute embeddings.
-2. [Materialize](#materialize-satellite-images): download, re-project, and crop satellite images to align with the windows.
-3. [Compute embeddings](#compute-and-save-embeddings): initialize the OlmoEarth pre-trained model and compute and save embeddings.
+1. Create windows in an rslearn dataset that define the spatiotemporal boxes for which
+   we want to compute embeddings.
+
+2. Materialize satellite images in the rslearn dataset.
+
+3. Initialize the OlmoEarth pre-trained model and compute and save embeddings.
 
 ## Create Windows
 
@@ -202,34 +204,31 @@ data:
             band_names:
               sentinel2_l2a: ["B02", "B03", "B04", "B08", "B05", "B06", "B07", "B8A", "B11", "B12", "B01", "B09"]
               sentinel1: ["vv", "vh"]
-      # We apply sliding-window inference (using 64x64 input crops) with overlap.
-      load_all_crops: true
+      # We apply sliding window inference (using 64x64 input crops) with overlap.
+      load_all_patches: true
       # This is the crop size for inference.
-      crop_size: 64
-      overlap_pixels: 32
+      patch_size: 64
+      overlap_ratio: 0.5
 trainer:
   callbacks:
    # The RslearnWriter will write our embeddings to a layer in the rslearn dataset.
     - class_path: rslearn.train.prediction_writer.RslearnWriter
       init_args:
+        # This path will be copied from data.init_args.path by rslearn.
+        path: placeholder
         # This references the "embeddings" layer that we will add to our dataset config
         # file to store the embeddings.
         output_layer: embeddings
         merger:
-          # The RasterMerge will merge the outputs across the different sliding-window
-          # crops that pertain to the same rslearn windows.
           class_path: rslearn.train.prediction_writer.RasterMerger
           init_args:
-            # This removes the border from the overlap_pixels. With model patch size 4
-            # and input crop size 64, the model produces a 16x16 output. We have
-            # overlap_pixels=32 at input resolution, which is 8 pixels at output
-            # resolution, so we remove 4 pixels from each side.
-            overlap_pixels: 8
-            # This lets the merger know what output resolution to expect relative to
-            # the window's resolution. Here, our output will be 1/patch_size relative
-            # to the window resolution (input resolution), since we compute one
-            # embedding per patch in the input, so we set the downsample_factor to
-            # patch_size.
+            # This removes the border from the overlap_ratio. With patch size 4 and
+            # input crop size 64, the model produces a 16x16 output, so we keep the
+            # middle 8x8 of that by removing 4 pixels of padding from each side.
+            padding: 4
+            # Set this equal to patch size, so the merger expects the output from the
+            # task to be at 1/(downsample_factor) resolution relative to the window
+            # resolution.
             downsample_factor: 4
 ```
 
@@ -244,8 +243,6 @@ dataset configuration file:
     "embeddings": {
       "band_sets": [{
           "dtype": "float32",
-          // Set this to the embedding size for your chosen OlmoEarth `model_id`.
-          // For example: NANO=128, TINY=192, BASE=768, LARGE=1024.
           "num_bands": 768
       }],
       "type": "raster"
@@ -264,33 +261,4 @@ You can visualize the output embeddings in qgis:
 
 ```
 qgis $DATASET_PATH/windows/default/default/layers/embeddings/*/geotiff.tif
-```
-
-## Fit a Downstream Head From Saved Embeddings
-
-Once the embeddings are written to the `"embeddings"` layer, you can train a
-lightweight head model using those precomputed features.
-
-The key is that you usually do **not** want to list every embedding band in the model
-config (e.g. 768 for `OLMOEARTH_V1_BASE`). Instead, set
-`use_all_bands_in_order_of_band_set_idx` to the target band set index so rslearn uses
-all band names from that band set in dataset-config order:
-
-```yaml
-data:
-  class_path: rslearn.train.data_module.RslearnDataModule
-  init_args:
-    path: ${DATASET_PATH}
-    inputs:
-      embeddings:
-        data_type: "raster"
-        layers: ["embeddings"]
-        use_all_bands_in_order_of_band_set_idx: 0
-        passthrough: true
-        dtype: FLOAT32
-      targets:
-        data_type: "vector"
-        layers: ["label"]
-        required: true
-        is_target: true
 ```

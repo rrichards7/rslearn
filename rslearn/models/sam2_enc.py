@@ -1,15 +1,14 @@
 """SegmentAnything2 encoders."""
 
+from typing import Any
+
 import torch
+import torch.nn as nn
 from sam2.build_sam import build_sam2
 from upath import UPath
 
-from rslearn.train.model_context import ModelContext
 
-from .component import FeatureExtractor, FeatureMaps
-
-
-class SAM2Encoder(FeatureExtractor):
+class SAM2Encoder(nn.Module):
     """SAM2's image encoder."""
 
     def __init__(self, model_identifier: str) -> None:
@@ -85,21 +84,18 @@ class SAM2Encoder(FeatureExtractor):
         del self.model.obj_ptr_proj
         del self.model.image_encoder.neck
 
-    def forward(self, context: ModelContext) -> FeatureMaps:
+    def forward(self, inputs: list[dict[str, Any]]) -> list[torch.Tensor]:
         """Extract multi-scale features from a batch of images.
 
         Args:
-            context: the model context. Input dicts must have a key 'image' containing
-                the input for the SAM2 image encoder.
+            inputs: List of dictionaries, each containing the input image under the key 'image'.
 
         Returns:
-            feature maps from the encoder.
+            List[torch.Tensor]: Multi-scale feature tensors from the encoder.
         """
-        images = torch.stack(
-            [inp["image"].single_ts_to_chw_tensor() for inp in context.inputs], dim=0
-        )
+        images = torch.stack([inp["image"] for inp in inputs], dim=0)
         features = self.encoder(images)
-        return FeatureMaps(features)
+        return features
 
     def get_backbone_channels(self) -> list[list[int]]:
         """Returns the output channels of the encoder at different scales.

@@ -236,8 +236,8 @@ class RasterImporter(Importer):
                     "windows in the rslearn dataset. When using settings like "
                     "max_matches=1 and space_mode=MOSAIC, this may cause windows outside "
                     "the geometry’s valid bounds to be materialized from the global raster "
-                    "instead of a more appropriate source. Consider increasing max_matches"
-                    "if this behavior is unintended."
+                    "instead of a more appropriate source. Consider using COMPOSITE mode, "
+                    "or increasing max_matches if this behavior is unintended."
                 )
 
             if spec.name:
@@ -275,11 +275,9 @@ class RasterImporter(Importer):
                 else:
                     bands = [f"B{band_idx + 1}" for band_idx in range(src.count)]
 
-            if tile_store.is_raster_ready(item, bands):
+            if tile_store.is_raster_ready(item.name, bands):
                 continue
-            tile_store.write_raster_file(
-                item, bands, fname_upath, time_range=item.geometry.time_range
-            )
+            tile_store.write_raster_file(item.name, bands, fname_upath)
 
 
 class VectorImporter(Importer):
@@ -366,7 +364,7 @@ class VectorImporter(Importer):
             item: the Item to ingest
             cur_geometries: the geometries where the item is needed.
         """
-        if tile_store.is_vector_ready(item):
+        if tile_store.is_vector_ready(item.name):
             return
 
         assert isinstance(item, VectorItem)
@@ -399,7 +397,7 @@ class VectorImporter(Importer):
                         )
                     )
 
-                tile_store.write_vector(item, features)
+                tile_store.write_vector(item.name, features)
 
 
 class LocalFiles(DataSource):
@@ -492,7 +490,7 @@ class LocalFiles(DataSource):
             groups.append(cur_groups)
         return groups
 
-    def deserialize_item(self, serialized_item: dict) -> RasterItem | VectorItem:
+    def deserialize_item(self, serialized_item: Any) -> RasterItem | VectorItem:
         """Deserializes an item from JSON-decoded data."""
         if self.layer_type == LayerType.RASTER:
             return RasterItem.deserialize(serialized_item)

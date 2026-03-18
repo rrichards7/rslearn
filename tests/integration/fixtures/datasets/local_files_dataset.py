@@ -63,10 +63,8 @@ def local_files_dataset(tmp_path: pathlib.Path) -> Dataset:
         json.dump(dataset_config, f)
 
     ds_path = UPath(tmp_path)
-    dataset = Dataset(ds_path)
-
     Window(
-        storage=dataset.storage,
+        path=Window.get_window_root(ds_path, "default", "default"),
         group="default",
         name="default",
         projection=WGS84_PROJECTION,
@@ -74,6 +72,7 @@ def local_files_dataset(tmp_path: pathlib.Path) -> Dataset:
         time_range=None,
     ).save()
 
+    dataset = Dataset(ds_path)
     # Hack for testing purposes
     dataset.src_dir = src_data_dir  # type: ignore
     return dataset

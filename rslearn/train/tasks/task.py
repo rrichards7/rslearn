@@ -7,7 +7,6 @@ import numpy.typing as npt
 import torch
 from torchmetrics import MetricCollection
 
-from rslearn.train.model_context import RasterImage, SampleMetadata
 from rslearn.utils import Feature
 
 
@@ -21,8 +20,8 @@ class Task:
 
     def process_inputs(
         self,
-        raw_inputs: dict[str, RasterImage | list[Feature]],
-        metadata: SampleMetadata,
+        raw_inputs: dict[str, torch.Tensor | list[Feature]],
+        metadata: dict[str, Any],
         load_targets: bool = True,
     ) -> tuple[dict[str, Any], dict[str, Any]]:
         """Processes the data into targets.
@@ -39,7 +38,7 @@ class Task:
         raise NotImplementedError
 
     def process_output(
-        self, raw_output: Any, metadata: SampleMetadata
+        self, raw_output: Any, metadata: dict[str, Any]
     ) -> npt.NDArray[Any] | list[Feature] | dict[str, Any]:
         """Processes an output into raster or vector data.
 
@@ -92,40 +91,6 @@ class BasicTask(Task):
         self.image_bands = image_bands
         self.remap_values = remap_values
 
-    @staticmethod
-    def _get_window_valid_mask(
-        reference_hw: torch.Tensor, metadata: SampleMetadata
-    ) -> torch.Tensor:
-        """Return an HW float mask of pixels that fall within window_bounds.
-
-        Raster readers may pad regions outside window_bounds (but inside crop_bounds)
-        with zeros when decoding. This mask lets tasks treat those padded pixels as
-        invalid, independent of any nodata_value semantics.
-        """
-        if reference_hw.ndim != 2:
-            raise ValueError(
-                f"expected an HW tensor for reference_hw, got shape {reference_hw.shape}"
-            )
-
-        window_x0, window_y0, window_x1, window_y1 = metadata.window_bounds
-        crop_x0, crop_y0, crop_x1, crop_y1 = metadata.crop_bounds
-        inter_x0 = max(window_x0, crop_x0)
-        inter_y0 = max(window_y0, crop_y0)
-        inter_x1 = min(window_x1, crop_x1)
-        inter_y1 = min(window_y1, crop_y1)
-
-        window_valid = torch.zeros(
-            reference_hw.shape, dtype=torch.float32, device=reference_hw.device
-        )
-        if inter_x0 < inter_x1 and inter_y0 < inter_y1:
-            x0 = int(inter_x0 - crop_x0)
-            y0 = int(inter_y0 - crop_y0)
-            x1 = int(inter_x1 - crop_x0)
-            y1 = int(inter_y1 - crop_y0)
-            window_valid[y0:y1, x0:x1] = 1.0
-
-        return window_valid
-
     def visualize(
         self,
         input_dict: dict[str, Any],
@@ -142,10 +107,10 @@ class BasicTask(Task):
         Returns:
             a dictionary mapping image name to visualization image
         """
-        raster_image = input_dict["image"]
-        assert isinstance(raster_image, RasterImage)
-        # We don't really handle time series here, just use the first timestep.
-        image = raster_image.image.cpu()[self.image_bands, 0, :, :]
+        INPUT_KEY = "sentinel2_l2a" # same issue with prithvi model
+
+        image = input_dict[INPUT_KEY].cpu()
+        image = image[self.image_bands, :, :]
         if self.remap_values:
             factor = (self.remap_values[1][1] - self.remap_values[1][0]) / (
                 self.remap_values[0][1] - self.remap_values[0][0]

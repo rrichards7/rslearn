@@ -3,9 +3,9 @@
 from typing import Any
 
 import numpy.typing as npt
+import torch
 from torchmetrics import Metric, MetricCollection
 
-from rslearn.train.model_context import RasterImage, SampleMetadata
 from rslearn.utils import Feature
 
 from .task import Task
@@ -29,8 +29,8 @@ class MultiTask(Task):
 
     def process_inputs(
         self,
-        raw_inputs: dict[str, RasterImage | list[Feature]],
-        metadata: SampleMetadata,
+        raw_inputs: dict[str, torch.Tensor | list[Feature]],
+        metadata: dict[str, Any],
         load_targets: bool = True,
     ) -> tuple[dict[str, Any], dict[str, Any]]:
         """Processes the data into targets.
@@ -46,12 +46,14 @@ class MultiTask(Task):
         """
         input_dict = {}
         target_dict = {}
-        if metadata.dataset_source is None:
+        if metadata["dataset_source"] is None:
             # No multi-dataset, so always compute across all tasks
             task_iter = list(self.tasks.items())
         else:
             # Multi-dataset, so only compute for the task in this dataset
-            task_iter = [(metadata.dataset_source, self.tasks[metadata.dataset_source])]
+            task_iter = [
+                (metadata["dataset_source"], self.tasks[metadata["dataset_source"]])
+            ]
 
         for task_name, task in task_iter:
             cur_raw_inputs = {}
@@ -69,13 +71,12 @@ class MultiTask(Task):
         return input_dict, target_dict
 
     def process_output(
-        self, raw_output: Any, metadata: SampleMetadata
+        self, raw_output: Any, metadata: dict[str, Any]
     ) -> dict[str, Any]:
         """Processes an output into raster or vector data.
 
         Args:
-            raw_output: the output from prediction head. It must be a dict mapping from
-                task name to per-task output for this sample.
+            raw_output: the output from prediction head.
             metadata: metadata about the patch being read
 
         Returns:
@@ -118,16 +119,13 @@ class MultiTask(Task):
 
     def get_metrics(self) -> MetricCollection:
         """Get metrics for this task."""
-        # Flatten metrics into a single dict with task_name/ prefix to avoid nested
-        # MetricCollections. Nested collections cause issues because MetricCollection
-        # has postfix=None which breaks MetricCollection.compute().
-        all_metrics = {}
+        metrics = []
         for task_name, task in self.tasks.items():
+            cur_metrics = {}
             for metric_name, metric in task.get_metrics().items():
-                all_metrics[f"{task_name}/{metric_name}"] = MetricWrapper(
-                    task_name, metric
-                )
-        return MetricCollection(all_metrics)
+                cur_metrics[metric_name] = MetricWrapper(task_name, metric)
+            metrics.append(MetricCollection(cur_metrics, prefix=f"{task_name}/"))
+        return MetricCollection(metrics)
 
 
 class MetricWrapper(Metric):
@@ -170,16 +168,7 @@ class MetricWrapper(Metric):
 
     def compute(self) -> Any:
         """Returns the computed metric."""
-        result = self.metric.compute()
-        # If the inner metric returns a dict, prefix each key with the task name so
-        # keys don't clash across tasks in MetricCollection. For scalar metrics, the
-        # name in the MetricCollection will be included as a prefix in the dict
-        # returned from MetricCollection.compute(), but for dict metrics, it copies
-        # over the key directly with no prefixing, so we need to handle the prefixing
-        # ourselves.
-        if isinstance(result, dict):
-            return {f"{self.task_name}/{k}": v for k, v in result.items()}
-        return result
+        return self.metric.compute()
 
     def reset(self) -> None:
         """Reset metric."""

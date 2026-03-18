@@ -131,7 +131,7 @@ def add_windows_from_geometries(
                     f"_{time_range[0].isoformat()}_{time_range[1].isoformat()}"
                 )
         window = Window(
-            storage=dataset.storage,
+            path=dataset.path / "windows" / group / cur_window_name,
             group=group,
             name=cur_window_name,
             projection=cur_projection,

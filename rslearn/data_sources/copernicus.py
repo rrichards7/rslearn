@@ -37,7 +37,6 @@ from rslearn.utils.geometry import (
     split_shape_at_antimeridian,
 )
 from rslearn.utils.grid_index import GridIndex
-from rslearn.utils.raster_array import RasterArray
 from rslearn.utils.raster_format import get_raster_projection_and_bounds
 
 SENTINEL2_TILE_URL = "https://sentiwiki.copernicus.eu/__attachments/1692737/S2A_OPER_GIP_TILPAR_MPC__20151209T095117_V20150622T000000_21000101T000000_B00.zip"
@@ -354,8 +353,9 @@ class Copernicus(DataSource):
                 self.username = os.environ["COPERNICUS_USERNAME"]
                 self.password = os.environ["COPERNICUS_PASSWORD"]
 
-    def deserialize_item(self, serialized_item: dict) -> CopernicusItem:
+    def deserialize_item(self, serialized_item: Any) -> CopernicusItem:
         """Deserializes an item from JSON-decoded data."""
+        assert isinstance(serialized_item, dict)
         return CopernicusItem.deserialize(serialized_item)
 
     def _get(self, path: str) -> dict[str, Any]:
@@ -590,7 +590,7 @@ class Copernicus(DataSource):
 
             # Get each raster that is needed.
             for glob_pattern, band_names in self.glob_to_bands.items():
-                if tile_store.is_raster_ready(item, band_names):
+                if tile_store.is_raster_ready(item.name, band_names):
                     continue
 
                 member_name = self._zip_member_glob(member_names, glob_pattern)
@@ -603,10 +603,7 @@ class Copernicus(DataSource):
                     # Now we can ingest it.
                     logger.debug(f"Ingesting the raster for bands {band_names}")
                     tile_store.write_raster_file(
-                        item,
-                        band_names,
-                        UPath(local_raster_fname),
-                        time_range=item.geometry.time_range,
+                        item.name, band_names, UPath(local_raster_fname)
                     )
 
     def ingest(
@@ -627,7 +624,7 @@ class Copernicus(DataSource):
             # hasn't been ingested yet.
             any_rasters_needed = False
             for band_names in self.glob_to_bands.values():
-                if tile_store.is_raster_ready(item, band_names):
+                if tile_store.is_raster_ready(item.name, band_names):
                     continue
                 any_rasters_needed = True
                 break
@@ -822,7 +819,7 @@ class Sentinel2(Copernicus):
 
             # Get each raster that is needed.
             for glob_pattern, band_names in self.glob_to_bands.items():
-                if tile_store.is_raster_ready(item, band_names):
+                if tile_store.is_raster_ready(item.name, band_names):
                     continue
 
                 member_name = self._zip_member_glob(member_names, glob_pattern)
@@ -838,10 +835,7 @@ class Sentinel2(Copernicus):
                         # No callback -- we can just ingest the file directly.
                         # Or it is TCI product which is not impacted by the harmonization issue.
                         tile_store.write_raster_file(
-                            item,
-                            band_names,
-                            UPath(local_raster_fname),
-                            time_range=item.geometry.time_range,
+                            item.name, band_names, UPath(local_raster_fname)
                         )
 
                     else:
@@ -852,14 +846,7 @@ class Sentinel2(Copernicus):
                             projection, bounds = get_raster_projection_and_bounds(src)
                         array = harmonize_callback(array)
                         tile_store.write_raster(
-                            item,
-                            band_names,
-                            projection,
-                            bounds,
-                            RasterArray(
-                                chw_array=array,
-                                time_range=item.geometry.time_range,
-                            ),
+                            item.name, band_names, projection, bounds, array
                         )
 
 

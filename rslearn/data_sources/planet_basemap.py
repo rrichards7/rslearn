@@ -234,8 +234,9 @@ class PlanetBasemap(DataSource):
 
         return groups
 
-    def deserialize_item(self, serialized_item: dict) -> Item:
+    def deserialize_item(self, serialized_item: Any) -> Item:
         """Deserializes an item from JSON-decoded data."""
+        assert isinstance(serialized_item, dict)
         return PlanetItem.deserialize(serialized_item)
 
     def ingest(
@@ -252,7 +253,7 @@ class PlanetBasemap(DataSource):
             geometries: a list of geometries needed for each item
         """
         for item in items:
-            if tile_store.is_raster_ready(item, self.bands):
+            if tile_store.is_raster_ready(item.name, self.bands):
                 continue
 
             assert isinstance(item, PlanetItem)
@@ -271,9 +272,4 @@ class PlanetBasemap(DataSource):
                     for chunk in response.iter_content(chunk_size=8192):
                         f.write(chunk)
 
-                tile_store.write_raster_file(
-                    item,
-                    self.bands,
-                    UPath(local_fname),
-                    time_range=item.geometry.time_range,
-                )
+                tile_store.write_raster_file(item.name, self.bands, UPath(local_fname))
